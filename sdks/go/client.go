@@ -1,6 +1,7 @@
 package quarkmq
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -10,12 +11,20 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// JsonRpcRequest represents a JSON-RPC 2.0 request.
+// JsonRpcRequest represents a JSON-RPC 2.0 request for outbound calls.
 type JsonRpcRequest struct {
 	Jsonrpc string      `json:"jsonrpc"`
 	Method  string      `json:"method"`
 	Params  interface{} `json:"params"`
 	ID      interface{} `json:"id,omitempty"`
+}
+
+// jsonRpcNotification is used for inbound notifications with raw params.
+type jsonRpcNotification struct {
+	Jsonrpc string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+	ID      interface{}     `json:"id,omitempty"`
 }
 
 // JsonRpcResponse represents a JSON-RPC 2.0 response.
@@ -55,6 +64,7 @@ type ChannelInfo struct {
 	Name         string   `json:"name"`
 	Topics       []string `json:"topics"`
 	PendingCount int      `json:"pending_count"`
+	DlqCount     int      `json:"dlq_count"`
 }
 
 // ListChannelsResult is returned by ListChannels.
@@ -62,49 +72,138 @@ type ListChannelsResult struct {
 	Channels []ChannelInfo `json:"channels"`
 }
 
+// subscription records a subscribe call for replay after reconnect.
+type subscription struct {
+	channel string
+	topic   string
+}
+
 // Client is a QuarkMQ client that communicates via WebSocket + JSON-RPC.
 type Client struct {
-	conn     *websocket.Conn
-	nextID   atomic.Int64
-	pending  map[int64]chan *JsonRpcResponse
-	mu       sync.Mutex
+	url  string
+	opts *Options
+
+	conn    *websocket.Conn
+	connMu  sync.Mutex // protects conn writes
+	nextID  atomic.Int64
+	pending map[int64]chan *JsonRpcResponse
+
+	pendingMu sync.Mutex // protects pending map
+
 	Messages chan *MessagePush
 	done     chan struct{}
+	wg       sync.WaitGroup
+	respPool sync.Pool
+
+	state atomic.Int32
+
+	subs   []subscription
+	subsMu sync.Mutex
+
+	reconnectCh chan struct{}
+	closedMu    sync.Mutex
+	closed      bool
 }
 
 // Connect establishes a WebSocket connection to the QuarkMQ server.
-func Connect(url string) (*Client, error) {
-	dialer := websocket.DefaultDialer
-	dialer.HandshakeTimeout = 10 * time.Second
-
-	conn, _, err := dialer.Dial(url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
+func Connect(ctx context.Context, url string, opts ...Option) (*Client, error) {
+	options := defaultOptions()
+	for _, opt := range opts {
+		opt(options)
 	}
 
 	c := &Client{
-		conn:     conn,
-		pending:  make(map[int64]chan *JsonRpcResponse),
-		Messages: make(chan *MessagePush, 1000),
-		done:     make(chan struct{}),
+		url:     url,
+		opts:    options,
+		pending: make(map[int64]chan *JsonRpcResponse),
+		Messages: make(chan *MessagePush, options.MessageBufferSize),
+		done:    make(chan struct{}),
+		respPool: sync.Pool{
+			New: func() interface{} {
+				return make(chan *JsonRpcResponse, 1)
+			},
+		},
+		reconnectCh: make(chan struct{}, 1),
 	}
 	c.nextID.Store(1)
 
+	if err := c.dial(ctx); err != nil {
+		return nil, err
+	}
+
+	c.setState(Connected)
+
+	c.wg.Add(1)
 	go c.readLoop()
+
+	if options.AutoReconnect {
+		c.wg.Add(1)
+		go c.reconnectLoop()
+	}
 
 	return c, nil
 }
 
-// Close closes the WebSocket connection.
+// Close closes the WebSocket connection and waits for goroutines to exit.
 func (c *Client) Close() error {
+	c.closedMu.Lock()
+	if c.closed {
+		c.closedMu.Unlock()
+		return nil
+	}
+	c.closed = true
+	c.closedMu.Unlock()
+
 	close(c.done)
-	return c.conn.Close()
+	c.connMu.Lock()
+	err := c.conn.Close()
+	c.connMu.Unlock()
+	c.wg.Wait()
+	c.setState(Disconnected)
+	return err
+}
+
+// State returns the current connection state.
+func (c *Client) State() ConnectionState {
+	return ConnectionState(c.state.Load())
+}
+
+func (c *Client) dial(ctx context.Context) error {
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = c.opts.HandshakeTimeout
+
+	conn, _, err := dialer.DialContext(ctx, c.url, nil)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+
+	c.connMu.Lock()
+	c.conn = conn
+	c.connMu.Unlock()
+	return nil
 }
 
 func (c *Client) readLoop() {
+	defer c.wg.Done()
 	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
+			// Check if we're shutting down
+			select {
+			case <-c.done:
+				return
+			default:
+			}
+
+			c.failAllPending(fmt.Errorf("connection lost: %w", err))
+			c.setState(Disconnected)
+			c.triggerReconnect()
 			return
 		}
 
@@ -113,12 +212,12 @@ func (c *Client) readLoop() {
 		if json.Unmarshal(msg, &resp) == nil && resp.ID != nil {
 			if idFloat, ok := resp.ID.(float64); ok {
 				id := int64(idFloat)
-				c.mu.Lock()
+				c.pendingMu.Lock()
 				ch, exists := c.pending[id]
 				if exists {
 					delete(c.pending, id)
 				}
-				c.mu.Unlock()
+				c.pendingMu.Unlock()
 				if exists {
 					ch <- &resp
 				}
@@ -127,11 +226,10 @@ func (c *Client) readLoop() {
 		}
 
 		// Try as notification (server push)
-		var req JsonRpcRequest
-		if json.Unmarshal(msg, &req) == nil && req.Method == "message" {
-			paramsBytes, _ := json.Marshal(req.Params)
+		var notif jsonRpcNotification
+		if json.Unmarshal(msg, &notif) == nil && notif.Method == "message" {
 			var push MessagePush
-			if json.Unmarshal(paramsBytes, &push) == nil {
+			if json.Unmarshal(notif.Params, &push) == nil {
 				select {
 				case c.Messages <- &push:
 				default:
@@ -142,7 +240,7 @@ func (c *Client) readLoop() {
 	}
 }
 
-func (c *Client) call(method string, params interface{}) (*JsonRpcResponse, error) {
+func (c *Client) call(ctx context.Context, method string, params interface{}) (*JsonRpcResponse, error) {
 	id := c.nextID.Add(1) - 1
 	req := JsonRpcRequest{
 		Jsonrpc: "2.0",
@@ -156,52 +254,89 @@ func (c *Client) call(method string, params interface{}) (*JsonRpcResponse, erro
 		return nil, err
 	}
 
-	ch := make(chan *JsonRpcResponse, 1)
-	c.mu.Lock()
-	c.pending[id] = ch
-	c.mu.Unlock()
+	ch := c.respPool.Get().(chan *JsonRpcResponse)
+	// Drain any stale data from recycled channel
+	select {
+	case <-ch:
+	default:
+	}
 
-	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		c.mu.Lock()
+	c.pendingMu.Lock()
+	c.pending[id] = ch
+	c.pendingMu.Unlock()
+
+	c.connMu.Lock()
+	writeErr := c.conn.WriteMessage(websocket.TextMessage, data)
+	c.connMu.Unlock()
+
+	if writeErr != nil {
+		c.pendingMu.Lock()
 		delete(c.pending, id)
-		c.mu.Unlock()
-		return nil, err
+		c.pendingMu.Unlock()
+		c.respPool.Put(ch)
+		return nil, writeErr
+	}
+
+	// Determine timeout: use context deadline if set, otherwise default RPC timeout
+	var timeoutCh <-chan time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		timeoutCh = time.After(time.Until(deadline))
+	} else {
+		timeoutCh = time.After(c.opts.DefaultRPCTimeout)
 	}
 
 	select {
 	case resp := <-ch:
+		c.respPool.Put(ch)
 		if resp.Error != nil {
 			return nil, resp.Error
 		}
 		return resp, nil
-	case <-time.After(10 * time.Second):
-		c.mu.Lock()
+	case <-timeoutCh:
+		c.pendingMu.Lock()
 		delete(c.pending, id)
-		c.mu.Unlock()
+		c.pendingMu.Unlock()
+		c.respPool.Put(ch)
 		return nil, fmt.Errorf("timeout waiting for response")
+	case <-ctx.Done():
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+		c.respPool.Put(ch)
+		return nil, ctx.Err()
 	case <-c.done:
+		c.respPool.Put(ch)
 		return nil, fmt.Errorf("connection closed")
 	}
 }
 
 // CreateChannel creates a new channel.
-func (c *Client) CreateChannel(name string, ackTimeoutSecs int, maxDeliveryAttempts int) error {
+func (c *Client) CreateChannel(ctx context.Context, name string, ackTimeoutSecs int, maxDeliveryAttempts int) error {
 	params := map[string]interface{}{
-		"name":                   name,
-		"ack_timeout_secs":       ackTimeoutSecs,
-		"max_delivery_attempts":  maxDeliveryAttempts,
+		"name":                  name,
+		"ack_timeout_secs":      ackTimeoutSecs,
+		"max_delivery_attempts": maxDeliveryAttempts,
 	}
-	_, err := c.call("create_channel", params)
+	_, err := c.call(ctx, "create_channel", params)
+	return err
+}
+
+// DeleteChannel deletes a channel.
+func (c *Client) DeleteChannel(ctx context.Context, name string) error {
+	params := map[string]interface{}{
+		"name": name,
+	}
+	_, err := c.call(ctx, "delete_channel", params)
 	return err
 }
 
 // Publish sends a message to a channel.
-func (c *Client) Publish(channel string, payload interface{}) (string, error) {
+func (c *Client) Publish(ctx context.Context, channel string, payload interface{}) (string, error) {
 	params := map[string]interface{}{
 		"channel": channel,
 		"payload": payload,
 	}
-	resp, err := c.call("publish", params)
+	resp, err := c.call(ctx, "publish", params)
 	if err != nil {
 		return "", err
 	}
@@ -215,37 +350,46 @@ func (c *Client) Publish(channel string, payload interface{}) (string, error) {
 	return result.MessageID, nil
 }
 
-// Subscribe subscribes to a channel topic.
-func (c *Client) Subscribe(channel, topic string) error {
+// Subscribe subscribes to a channel topic. The subscription is tracked for replay after reconnect.
+func (c *Client) Subscribe(ctx context.Context, channel, topic string) error {
 	params := map[string]interface{}{
 		"channel": channel,
 		"topic":   topic,
 	}
-	_, err := c.call("subscribe", params)
-	return err
+	_, err := c.call(ctx, "subscribe", params)
+	if err != nil {
+		return err
+	}
+
+	// Track subscription for reconnect replay
+	c.subsMu.Lock()
+	c.subs = append(c.subs, subscription{channel: channel, topic: topic})
+	c.subsMu.Unlock()
+
+	return nil
 }
 
 // Ack acknowledges a message.
-func (c *Client) Ack(messageID string) error {
+func (c *Client) Ack(ctx context.Context, messageID string) error {
 	params := map[string]interface{}{
 		"message_id": messageID,
 	}
-	_, err := c.call("ack", params)
+	_, err := c.call(ctx, "ack", params)
 	return err
 }
 
 // Nack negatively acknowledges a message (triggers redelivery).
-func (c *Client) Nack(messageID string) error {
+func (c *Client) Nack(ctx context.Context, messageID string) error {
 	params := map[string]interface{}{
 		"message_id": messageID,
 	}
-	_, err := c.call("nack", params)
+	_, err := c.call(ctx, "nack", params)
 	return err
 }
 
 // ListChannels returns all channels.
-func (c *Client) ListChannels() (*ListChannelsResult, error) {
-	resp, err := c.call("list_channels", map[string]interface{}{})
+func (c *Client) ListChannels(ctx context.Context) (*ListChannelsResult, error) {
+	resp, err := c.call(ctx, "list_channels", map[string]interface{}{})
 	if err != nil {
 		return nil, err
 	}

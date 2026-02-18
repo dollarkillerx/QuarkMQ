@@ -12,22 +12,34 @@ pub struct GarbageCollector;
 impl GarbageCollector {
     /// Remove messages that have been ACKed by all topics.
     /// `acked_messages` should contain message IDs that are fully ACKed.
+    /// After removing index entries, checks for empty segments and deletes their files.
     pub fn collect(
         acked_messages: &HashSet<MessageId>,
         index: &mut MessageIndex,
         segments: &mut SegmentManager,
     ) -> Result<GcStats, StorageError> {
         let mut removed_count = 0;
+        let mut affected_segments = HashSet::new();
 
         for msg_id in acked_messages {
-            if index.remove(msg_id).is_some() {
+            if let Some(loc) = index.remove(msg_id) {
                 removed_count += 1;
+                affected_segments.insert(loc.segment_id);
+            }
+        }
+
+        // Check if any affected segments are now empty and can be reclaimed
+        let mut segments_removed = 0;
+        for segment_id in affected_segments {
+            if index.messages_in_segment(segment_id).is_empty() {
+                segments.remove_segment(segment_id)?;
+                segments_removed += 1;
             }
         }
 
         Ok(GcStats {
             messages_removed: removed_count,
-            segments_removed: 0,
+            segments_removed,
         })
     }
 }

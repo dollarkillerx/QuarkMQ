@@ -25,6 +25,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ChannelDefaults {
     #[serde(default = "default_ack_timeout")]
     pub ack_timeout_secs: u64,
@@ -58,6 +59,7 @@ fn default_max_inflight() -> usize {
     100
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Config {
     fn default() -> Self {
         Self {

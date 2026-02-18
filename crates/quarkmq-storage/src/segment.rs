@@ -1,31 +1,34 @@
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::wal::WalRecord;
 use crate::StorageError;
 
-const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64MB
-
 /// A single segment file containing WAL records.
+/// Keeps the file descriptor open for writes to avoid re-opening on every append.
 pub struct Segment {
     path: PathBuf,
     id: u64,
     max_size: u64,
     current_size: u64,
     sealed: bool,
+    writer: Option<BufWriter<std::fs::File>>,
 }
 
 impl Segment {
     pub fn create(dir: &Path, id: u64, max_size: u64) -> Result<Self, StorageError> {
         let path = Self::segment_path(dir, id);
-        // Create the file
-        std::fs::File::create(&path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         Ok(Self {
             path,
             id,
             max_size,
             current_size: 0,
             sealed: false,
+            writer: Some(BufWriter::new(file)),
         })
     }
 
@@ -35,12 +38,20 @@ impl Segment {
         let current_size = metadata.len();
         let sealed = current_size >= max_size;
 
+        let writer = if !sealed {
+            let file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            Some(BufWriter::new(file))
+        } else {
+            None
+        };
+
         Ok(Self {
             path,
             id,
             max_size,
             current_size,
             sealed,
+            writer,
         })
     }
 
@@ -58,12 +69,16 @@ impl Segment {
 
         if self.current_size + record_size > self.max_size {
             self.sealed = true;
+            self.writer = None;
             return Err(StorageError::SegmentFull);
         }
 
-        let mut file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            StorageError::Io(io::Error::other("segment writer not open"))
+        })?;
         let offset = self.current_size;
-        file.write_all(&encoded)?;
+        writer.write_all(&encoded)?;
+        writer.flush()?;
         self.current_size += record_size;
 
         Ok(offset)
@@ -105,6 +120,7 @@ impl Segment {
 
     pub fn seal(&mut self) {
         self.sealed = true;
+        self.writer = None;
     }
 
     pub fn id(&self) -> u64 {

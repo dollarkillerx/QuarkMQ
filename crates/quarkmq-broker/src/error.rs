@@ -20,6 +20,12 @@ pub enum BrokerError {
     #[error("message not inflight: {0}")]
     MessageNotInflight(uuid::Uuid),
 
+    #[error("message dead-lettered: {0}")]
+    MessageDeadLettered(uuid::Uuid),
+
+    #[error("storage error: {0}")]
+    Storage(#[from] quarkmq_storage::StorageError),
+
     #[error("protocol error: {0}")]
     Protocol(#[from] quarkmq_protocol::ProtocolError),
 }

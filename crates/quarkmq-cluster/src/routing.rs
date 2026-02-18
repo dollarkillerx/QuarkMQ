@@ -82,7 +82,7 @@ impl Router {
     /// Uses the lowest-ID alive replica.
     pub async fn elect_new_primary(
         &self,
-        channel_name: &str,
+        _channel_name: &str,
         failed_node_id: &str,
         cluster: &ClusterState,
     ) -> Option<NodeInfo> {

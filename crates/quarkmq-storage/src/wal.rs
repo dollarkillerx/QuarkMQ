@@ -11,7 +11,6 @@ use crate::StorageError;
 /// WAL Record layout:
 /// [sequence: u64] [op: u8] [msg_id: 16B] [data_len: u32] [data: N bytes] [crc32: u32]
 /// Total header: 8 + 1 + 16 + 4 = 29 bytes + data + 4 bytes CRC
-
 const RECORD_HEADER_SIZE: usize = 8 + 1 + 16 + 4; // 29 bytes
 const CRC_SIZE: usize = 4;
 
@@ -22,6 +21,7 @@ pub enum WalOperation {
     Ack = 2,
     Nack = 3,
     Delete = 4,
+    DeadLetter = 5,
 }
 
 impl WalOperation {
@@ -31,6 +31,7 @@ impl WalOperation {
             2 => Some(Self::Ack),
             3 => Some(Self::Nack),
             4 => Some(Self::Delete),
+            5 => Some(Self::DeadLetter),
             _ => None,
         }
     }
@@ -137,11 +138,19 @@ pub struct Wal {
     path: PathBuf,
     writer: BufWriter<std::fs::File>,
     next_sequence: u64,
-    sync_interval_ms: u64,
+}
+
+impl std::fmt::Debug for Wal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wal")
+            .field("path", &self.path)
+            .field("next_sequence", &self.next_sequence)
+            .finish()
+    }
 }
 
 impl Wal {
-    pub fn open(path: impl AsRef<Path>, sync_interval_ms: u64) -> Result<Self, StorageError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
 
         if let Some(parent) = path.parent() {
@@ -165,7 +174,6 @@ impl Wal {
             path,
             writer: BufWriter::new(file),
             next_sequence,
-            sync_interval_ms,
         })
     }
 
@@ -174,7 +182,8 @@ impl Wal {
         let encoded = record.encode();
 
         self.writer.write_all(&encoded)?;
-        self.writer.flush()?;
+        // Flush is deferred to sync() for batch efficiency.
+        // Callers should invoke sync() periodically or after critical writes.
 
         self.next_sequence += 1;
         Ok(record)
@@ -306,7 +315,7 @@ mod tests {
         let msg2 = Uuid::now_v7();
 
         {
-            let mut wal = Wal::open(&wal_path, 100).unwrap();
+            let mut wal = Wal::open(&wal_path).unwrap();
             wal.append(WalOperation::Append, msg1, b"message 1".to_vec()).unwrap();
             wal.append(WalOperation::Append, msg2, b"message 2".to_vec()).unwrap();
             wal.append(WalOperation::Ack, msg1, vec![]).unwrap();
@@ -328,15 +337,17 @@ mod tests {
         let wal_path = dir.path().join("test.wal");
 
         {
-            let mut wal = Wal::open(&wal_path, 100).unwrap();
+            let mut wal = Wal::open(&wal_path).unwrap();
             wal.append(WalOperation::Append, Uuid::now_v7(), b"m1".to_vec()).unwrap();
             wal.append(WalOperation::Append, Uuid::now_v7(), b"m2".to_vec()).unwrap();
+            wal.sync().unwrap();
         }
 
         {
-            let mut wal = Wal::open(&wal_path, 100).unwrap();
+            let mut wal = Wal::open(&wal_path).unwrap();
             assert_eq!(wal.next_sequence(), 3);
             wal.append(WalOperation::Append, Uuid::now_v7(), b"m3".to_vec()).unwrap();
+            wal.sync().unwrap();
         }
 
         let records = Wal::read_all_records(&wal_path).unwrap();
@@ -352,10 +363,11 @@ mod tests {
         let msg1 = Uuid::now_v7();
         let msg2 = Uuid::now_v7();
 
-        let mut wal = Wal::open(&wal_path, 100).unwrap();
+        let mut wal = Wal::open(&wal_path).unwrap();
         wal.append(WalOperation::Append, msg1, b"m1".to_vec()).unwrap();
         wal.append(WalOperation::Append, msg2, b"m2".to_vec()).unwrap();
         wal.append(WalOperation::Ack, msg1, vec![]).unwrap();
+        wal.sync().unwrap();
 
         // Compact: keep only msg2's append
         let records = vec![WalRecord::new(1, WalOperation::Append, msg2, b"m2".to_vec())];

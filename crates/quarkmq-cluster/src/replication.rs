@@ -14,6 +14,7 @@ pub struct ReplicationEntry {
 /// Handles async replication of WAL entries from primary to replicas.
 /// In a full implementation, this would use TCP connections to replicas.
 pub struct Replicator {
+    #[allow(dead_code)]
     local_node_id: String,
 }
 

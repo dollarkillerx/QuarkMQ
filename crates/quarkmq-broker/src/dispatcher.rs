@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use quarkmq_protocol::message::Message;
 use quarkmq_protocol::rpc::ConsumerId;
 use quarkmq_protocol::MessageId;
+use tokio::sync::Notify;
 
 use crate::channel::{Channel, ChannelConfig, Dispatch};
 use crate::error::BrokerError;
@@ -18,55 +21,96 @@ pub struct Subscription {
 
 /// The Dispatcher is the central broker coordinating channels and consumers.
 pub struct Dispatcher {
-    channels: Arc<RwLock<HashMap<String, Channel>>>,
+    channels: DashMap<String, Channel>,
     /// Tracks consumer_id → list of subscriptions
     subscriptions: Arc<RwLock<HashMap<ConsumerId, Vec<Subscription>>>>,
+    /// Notifies the dispatch loop that new messages are available.
+    dispatch_notify: Arc<Notify>,
+    /// Data directory for persistent storage. None = in-memory only.
+    data_dir: Option<PathBuf>,
 }
 
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
-            channels: Arc::new(RwLock::new(HashMap::new())),
+            channels: DashMap::new(),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            dispatch_notify: Arc::new(Notify::new()),
+            data_dir: None,
         }
+    }
+
+    /// Create a dispatcher with persistent storage.
+    pub fn with_storage(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        Self {
+            channels: DashMap::new(),
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            dispatch_notify: Arc::new(Notify::new()),
+            data_dir: Some(data_dir),
+        }
+    }
+
+    /// Returns a handle to the dispatch notifier for use by the dispatch loop.
+    pub fn dispatch_notify(&self) -> Arc<Notify> {
+        self.dispatch_notify.clone()
     }
 
     pub fn create_channel(&self, config: ChannelConfig) -> Result<(), BrokerError> {
-        let mut channels = self.channels.write();
-        if channels.contains_key(&config.name) {
-            return Err(BrokerError::ChannelAlreadyExists(config.name.clone()));
-        }
+        use dashmap::mapref::entry::Entry;
         let name = config.name.clone();
-        channels.insert(name, Channel::new(config));
-        Ok(())
+        match self.channels.entry(name) {
+            Entry::Occupied(_) => Err(BrokerError::ChannelAlreadyExists(config.name.clone())),
+            Entry::Vacant(e) => {
+                let channel = if let Some(ref data_dir) = self.data_dir {
+                    let channels_dir = data_dir.join("channels");
+                    Channel::with_storage(config, &channels_dir)?
+                } else {
+                    Channel::new(config)
+                };
+                e.insert(channel);
+                Ok(())
+            }
+        }
     }
 
     pub fn delete_channel(&self, name: &str) -> Result<(), BrokerError> {
-        let mut channels = self.channels.write();
-        if channels.remove(name).is_none() {
-            return Err(BrokerError::ChannelNotFound(name.to_string()));
+        let removed = self.channels.remove(name);
+        match removed {
+            Some((_, channel)) => {
+                // Delete channel directory if it exists
+                if let Some(dir) = channel.data_dir() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                Ok(())
+            }
+            None => Err(BrokerError::ChannelNotFound(name.to_string())),
         }
-        Ok(())
     }
 
     pub fn list_channels(&self) -> Vec<quarkmq_protocol::rpc::ChannelInfo> {
-        let channels = self.channels.read();
-        channels
-            .values()
-            .map(|ch| quarkmq_protocol::rpc::ChannelInfo {
-                name: ch.config.name.clone(),
-                topics: ch.topic_names(),
-                pending_count: ch.pending_count(),
+        self.channels
+            .iter()
+            .map(|entry| {
+                let ch = entry.value();
+                quarkmq_protocol::rpc::ChannelInfo {
+                    name: ch.config.name.clone(),
+                    topics: ch.topic_names(),
+                    pending_count: ch.pending_count(),
+                    dlq_count: ch.dlq_count(),
+                }
             })
             .collect()
     }
 
     pub fn publish(&self, channel_name: &str, message: Message) -> Result<MessageId, BrokerError> {
-        let mut channels = self.channels.write();
-        let channel = channels
+        let mut channel = self
+            .channels
             .get_mut(channel_name)
             .ok_or_else(|| BrokerError::ChannelNotFound(channel_name.to_string()))?;
-        Ok(channel.publish(message))
+        let id = channel.publish(message)?;
+        self.dispatch_notify.notify_one();
+        Ok(id)
     }
 
     pub fn subscribe(
@@ -75,14 +119,13 @@ impl Dispatcher {
         topic_name: &str,
         consumer_id: ConsumerId,
     ) -> Result<(), BrokerError> {
-        let mut channels = self.channels.write();
-        let channel = channels
-            .get_mut(channel_name)
-            .ok_or_else(|| BrokerError::ChannelNotFound(channel_name.to_string()))?;
-
-        channel.subscribe(topic_name, consumer_id);
-
-        drop(channels);
+        {
+            let mut channel = self
+                .channels
+                .get_mut(channel_name)
+                .ok_or_else(|| BrokerError::ChannelNotFound(channel_name.to_string()))?;
+            channel.subscribe(topic_name, consumer_id);
+        }
 
         let mut subs = self.subscriptions.write();
         subs.entry(consumer_id).or_default().push(Subscription {
@@ -99,14 +142,13 @@ impl Dispatcher {
         topic_name: &str,
         consumer_id: ConsumerId,
     ) -> Result<(), BrokerError> {
-        let mut channels = self.channels.write();
-        let channel = channels
-            .get_mut(channel_name)
-            .ok_or_else(|| BrokerError::ChannelNotFound(channel_name.to_string()))?;
-
-        channel.unsubscribe(topic_name, consumer_id)?;
-
-        drop(channels);
+        {
+            let mut channel = self
+                .channels
+                .get_mut(channel_name)
+                .ok_or_else(|| BrokerError::ChannelNotFound(channel_name.to_string()))?;
+            channel.unsubscribe(topic_name, consumer_id)?;
+        }
 
         let mut subs = self.subscriptions.write();
         if let Some(sub_list) = subs.get_mut(&consumer_id) {
@@ -123,21 +165,19 @@ impl Dispatcher {
             subs.remove(&consumer_id).unwrap_or_default()
         };
 
-        let mut channels = self.channels.write();
         for sub in subs {
-            if let Some(channel) = channels.get_mut(&sub.channel) {
+            if let Some(mut channel) = self.channels.get_mut(&sub.channel) {
                 let _ = channel.unsubscribe(&sub.topic, consumer_id);
             }
         }
     }
 
     /// Dispatch pending messages across all channels.
-    /// Returns dispatches that need to be sent to consumers.
+    /// Each channel is locked individually, allowing concurrent access to different channels.
     pub fn dispatch_all(&self) -> Vec<Dispatch> {
-        let mut channels = self.channels.write();
         let mut all_dispatches = Vec::new();
-        for channel in channels.values_mut() {
-            all_dispatches.extend(channel.dispatch());
+        for mut entry in self.channels.iter_mut() {
+            all_dispatches.extend(entry.value_mut().dispatch());
         }
         all_dispatches
     }
@@ -150,9 +190,8 @@ impl Dispatcher {
         let subs = self.subscriptions.read();
         let consumer_subs = subs.get(&consumer_id).ok_or(BrokerError::NotSubscribed)?;
 
-        let mut channels = self.channels.write();
         for sub in consumer_subs {
-            if let Some(channel) = channels.get_mut(&sub.channel) {
+            if let Some(mut channel) = self.channels.get_mut(&sub.channel) {
                 match channel.ack(consumer_id, message_id) {
                     Ok(()) => return Ok(()),
                     Err(BrokerError::MessageNotInflight(_)) => continue,
@@ -172,11 +211,13 @@ impl Dispatcher {
         let subs = self.subscriptions.read();
         let consumer_subs = subs.get(&consumer_id).ok_or(BrokerError::NotSubscribed)?;
 
-        let mut channels = self.channels.write();
         for sub in consumer_subs {
-            if let Some(channel) = channels.get_mut(&sub.channel) {
+            if let Some(mut channel) = self.channels.get_mut(&sub.channel) {
                 match channel.nack(consumer_id, message_id) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        self.dispatch_notify.notify_one();
+                        return Ok(());
+                    }
                     Err(BrokerError::MessageNotInflight(_)) => continue,
                     Err(e) => return Err(e),
                 }
@@ -187,13 +228,107 @@ impl Dispatcher {
     }
 
     /// Check ACK timeouts across all channels. Returns dispatches to re-send.
+    /// Each channel is locked individually.
     pub fn check_timeouts(&self) -> Vec<Dispatch> {
-        let mut channels = self.channels.write();
         let mut all_dispatches = Vec::new();
-        for channel in channels.values_mut() {
-            all_dispatches.extend(channel.check_timeouts());
+        for mut entry in self.channels.iter_mut() {
+            all_dispatches.extend(entry.value_mut().check_timeouts());
         }
         all_dispatches
+    }
+
+    /// Recover all channels from persistent storage.
+    /// Returns the number of channels recovered.
+    pub fn recover(&self) -> Result<usize, BrokerError> {
+        let data_dir = match &self.data_dir {
+            Some(d) => d,
+            None => return Ok(0),
+        };
+
+        let channels_dir = data_dir.join("channels");
+        if !channels_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut count = 0;
+        let entries = std::fs::read_dir(&channels_dir).map_err(|e| {
+            BrokerError::Storage(quarkmq_storage::StorageError::Io(e))
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                BrokerError::Storage(quarkmq_storage::StorageError::Io(e))
+            })?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let meta_path = path.join("meta.json");
+            if !meta_path.exists() {
+                continue;
+            }
+
+            let meta_content = std::fs::read_to_string(&meta_path).map_err(|e| {
+                BrokerError::Storage(quarkmq_storage::StorageError::Io(e))
+            })?;
+            let config: ChannelConfig = serde_json::from_str(&meta_content).map_err(|e| {
+                BrokerError::Storage(quarkmq_storage::StorageError::Serialization(e))
+            })?;
+
+            let channel = Channel::recover(config.clone(), &path)?;
+            self.channels.insert(config.name, channel);
+            count += 1;
+        }
+
+        tracing::info!(count, "recovered channels from storage");
+        Ok(count)
+    }
+
+    /// Sync all channel WALs to disk.
+    pub fn sync_all(&self) -> Result<(), BrokerError> {
+        for mut entry in self.channels.iter_mut() {
+            entry.value_mut().sync_wal()?;
+        }
+        Ok(())
+    }
+
+    /// Compact all channel WALs.
+    pub fn compact_all(&self) -> Result<(), BrokerError> {
+        for mut entry in self.channels.iter_mut() {
+            entry.value_mut().compact_wal()?;
+        }
+        Ok(())
+    }
+
+    /// List DLQ messages for a specific channel.
+    pub fn list_dlq(&self, channel_name: &str) -> Result<Vec<quarkmq_protocol::rpc::DlqMessage>, BrokerError> {
+        let channel = self
+            .channels
+            .get(channel_name)
+            .ok_or_else(|| BrokerError::ChannelNotFound(channel_name.to_string()))?;
+
+        let messages = channel.dlq_messages()
+            .iter()
+            .map(|msg| quarkmq_protocol::rpc::DlqMessage {
+                message_id: msg.id,
+                channel: msg.channel.clone(),
+                payload: msg.payload.clone(),
+            })
+            .collect();
+
+        Ok(messages)
+    }
+
+    /// Retry a dead-lettered message.
+    pub fn retry_dlq(&self, channel_name: &str, message_id: &MessageId) -> Result<(), BrokerError> {
+        let mut channel = self
+            .channels
+            .get_mut(channel_name)
+            .ok_or_else(|| BrokerError::ChannelNotFound(channel_name.to_string()))?;
+        channel.retry_dlq(message_id)?;
+        self.dispatch_notify.notify_one();
+        Ok(())
     }
 }
 
@@ -373,9 +508,8 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0].consumer_id, c);
         assert_eq!(dispatches[0].message.id, msg_id);
-        // Attempt resets to 1 because NACK removes the inflight entry
-        // (attempt tracking only persists while inflight)
-        assert_eq!(dispatches[0].message.attempt, 1);
+        // Attempt is now cumulative: second dispatch = attempt 2
+        assert_eq!(dispatches[0].message.attempt, 2);
     }
 
     #[test]

@@ -15,14 +15,16 @@ fn free_port() -> u16 {
     port
 }
 
-/// Start a real QuarkMQ server on a random available port.
-/// Returns the port and a shutdown sender to stop the server.
-async fn start_test_server() -> (u16, tokio::sync::broadcast::Sender<()>) {
+/// Start a real QuarkMQ server on a random available port with a temp data dir.
+/// Returns the port, shutdown sender, and tempdir handle (must be kept alive).
+async fn start_test_server() -> (u16, tokio::sync::broadcast::Sender<()>, tempfile::TempDir) {
     let port = free_port();
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
 
     let mut config = Config::default();
     config.server.ws_bind = format!("127.0.0.1:{}", port);
     config.channels.ack_timeout_secs = 30;
+    config.node.data_dir = tmp_dir.path().to_string_lossy().to_string();
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
     let shutdown = shutdown_tx.clone();
@@ -35,7 +37,7 @@ async fn start_test_server() -> (u16, tokio::sync::broadcast::Sender<()>) {
     // Give the server time to bind the listener
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    (port, shutdown_tx)
+    (port, shutdown_tx, tmp_dir)
 }
 
 /// Connect a new QuarkMQClient to the test server.
@@ -66,7 +68,7 @@ async fn recv_messages(
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_create_channel_and_list() {
-    let (port, shutdown_tx) = start_test_server().await;
+    let (port, shutdown_tx, _tmp_dir) = start_test_server().await;
     let client = connect_client(port).await;
 
     // Create a channel
@@ -100,7 +102,7 @@ async fn test_create_channel_and_list() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_publish_subscribe_ack() {
-    let (port, shutdown_tx) = start_test_server().await;
+    let (port, shutdown_tx, _tmp_dir) = start_test_server().await;
 
     // Publisher client
     let publisher = connect_client(port).await;
@@ -152,7 +154,7 @@ async fn test_publish_subscribe_ack() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_competing_consumers() {
-    let (port, shutdown_tx) = start_test_server().await;
+    let (port, shutdown_tx, _tmp_dir) = start_test_server().await;
 
     let admin = connect_client(port).await;
     admin
@@ -224,7 +226,7 @@ async fn test_competing_consumers() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_fan_out() {
-    let (port, shutdown_tx) = start_test_server().await;
+    let (port, shutdown_tx, _tmp_dir) = start_test_server().await;
 
     let admin = connect_client(port).await;
     admin
@@ -319,7 +321,7 @@ async fn test_fan_out() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_nack_redelivery() {
-    let (port, shutdown_tx) = start_test_server().await;
+    let (port, shutdown_tx, _tmp_dir) = start_test_server().await;
 
     let admin = connect_client(port).await;
     admin
@@ -366,13 +368,10 @@ async fn test_nack_redelivery() {
     assert_eq!(push2.message_id, msg_id, "redelivered message should have same ID");
     assert_eq!(push2.channel, "retry-ch");
     assert_eq!(push2.payload, payload);
-    // The broker resets the inflight entry on NACK, so the attempt counter
-    // restarts at 1.  The key invariant is that the *same* message was
-    // redelivered (verified by message_id and payload above).
-    assert!(
-        push2.attempt >= 1,
-        "redelivered attempt ({}) should be at least 1",
-        push2.attempt
+    // With cumulative attempt tracking, attempt should be 2
+    assert_eq!(
+        push2.attempt, 2,
+        "redelivered attempt should be 2 (cumulative tracking)"
     );
 
     // Now ACK to complete the cycle

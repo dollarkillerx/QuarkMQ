@@ -17,32 +17,41 @@ pub struct InflightEntry {
 #[derive(Debug)]
 pub struct Topic {
     pub name: String,
-    consumers: Vec<Consumer>,
+    consumers: HashMap<ConsumerId, Consumer>,
+    /// Maintains round-robin ordering of consumer IDs.
+    consumer_order: Vec<ConsumerId>,
     dispatch_index: usize,
     inflight: HashMap<MessageId, InflightEntry>,
     ack_set: HashSet<MessageId>,
     pending_queue: VecDeque<MessageId>,
+    /// Cumulative delivery attempt counts, persisted across nack/re-dispatch.
+    delivery_attempts: HashMap<MessageId, u32>,
 }
 
 impl Topic {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            consumers: Vec::new(),
+            consumers: HashMap::new(),
+            consumer_order: Vec::new(),
             dispatch_index: 0,
             inflight: HashMap::new(),
             ack_set: HashSet::new(),
             pending_queue: VecDeque::new(),
+            delivery_attempts: HashMap::new(),
         }
     }
 
     pub fn add_consumer(&mut self, consumer: Consumer) {
-        self.consumers.push(consumer);
+        let id = consumer.id;
+        self.consumers.insert(id, consumer);
+        self.consumer_order.push(id);
     }
 
     pub fn remove_consumer(&mut self, consumer_id: ConsumerId) -> Vec<MessageId> {
-        self.consumers.retain(|c| c.id != consumer_id);
-        if self.dispatch_index >= self.consumers.len() && !self.consumers.is_empty() {
+        self.consumers.remove(&consumer_id);
+        self.consumer_order.retain(|&id| id != consumer_id);
+        if self.dispatch_index >= self.consumer_order.len() && !self.consumer_order.is_empty() {
             self.dispatch_index = 0;
         }
 
@@ -75,26 +84,28 @@ impl Topic {
     /// Try to dispatch the next pending message to a consumer via round-robin.
     /// Returns (consumer_id, message_id) if successful.
     pub fn try_dispatch(&mut self) -> Option<(ConsumerId, MessageId)> {
-        if self.consumers.is_empty() || self.pending_queue.is_empty() {
+        if self.consumer_order.is_empty() || self.pending_queue.is_empty() {
             return None;
         }
 
-        let num_consumers = self.consumers.len();
+        let num_consumers = self.consumer_order.len();
         for _ in 0..num_consumers {
             let idx = self.dispatch_index % num_consumers;
             self.dispatch_index = (self.dispatch_index + 1) % num_consumers;
 
-            if self.consumers[idx].can_accept() {
+            let consumer_id = self.consumer_order[idx];
+            let consumer = self.consumers.get(&consumer_id)?;
+            if consumer.can_accept() {
                 if let Some(msg_id) = self.pending_queue.pop_front() {
-                    let consumer_id = self.consumers[idx].id;
-                    self.consumers[idx].inflight_count += 1;
+                    self.consumers.get_mut(&consumer_id).unwrap().inflight_count += 1;
 
+                    // Track cumulative delivery attempts
                     let attempt = self
-                        .inflight
-                        .values()
-                        .find(|e| e.message_id == msg_id)
-                        .map(|e| e.attempt + 1)
-                        .unwrap_or(1);
+                        .delivery_attempts
+                        .entry(msg_id)
+                        .and_modify(|a| *a += 1)
+                        .or_insert(1);
+                    let attempt_val = *attempt;
 
                     self.inflight.insert(
                         msg_id,
@@ -102,7 +113,7 @@ impl Topic {
                             message_id: msg_id,
                             consumer_id,
                             dispatched_at: Utc::now(),
-                            attempt,
+                            attempt: attempt_val,
                         },
                     );
 
@@ -116,10 +127,11 @@ impl Topic {
     /// Acknowledge a message. Returns true if the message was inflight.
     pub fn ack(&mut self, message_id: &MessageId) -> bool {
         if let Some(entry) = self.inflight.remove(message_id) {
-            if let Some(c) = self.consumers.iter_mut().find(|c| c.id == entry.consumer_id) {
+            if let Some(c) = self.consumers.get_mut(&entry.consumer_id) {
                 c.inflight_count = c.inflight_count.saturating_sub(1);
             }
             self.ack_set.insert(*message_id);
+            self.delivery_attempts.remove(message_id);
             true
         } else {
             false
@@ -127,9 +139,10 @@ impl Topic {
     }
 
     /// NACK a message — put it back at the front of the pending queue.
+    /// Does NOT clear delivery_attempts (preserves cumulative count).
     pub fn nack(&mut self, message_id: &MessageId) -> bool {
         if let Some(entry) = self.inflight.remove(message_id) {
-            if let Some(c) = self.consumers.iter_mut().find(|c| c.id == entry.consumer_id) {
+            if let Some(c) = self.consumers.get_mut(&entry.consumer_id) {
                 c.inflight_count = c.inflight_count.saturating_sub(1);
             }
             self.pending_queue.push_front(*message_id);
@@ -140,29 +153,54 @@ impl Topic {
     }
 
     /// Check for timed-out inflight messages and return them to pending.
-    pub fn check_timeouts(&mut self, timeout_secs: u64) -> Vec<(ConsumerId, MessageId)> {
+    /// Returns (consumer_id, message_id, attempt_count) for each timed-out message.
+    pub fn check_timeouts(&mut self, timeout_secs: u64) -> Vec<(ConsumerId, MessageId, u32)> {
         let now = Utc::now();
         let mut timed_out = Vec::new();
 
-        let expired: Vec<(MessageId, ConsumerId)> = self
+        let expired: Vec<(MessageId, ConsumerId, u32)> = self
             .inflight
             .iter()
             .filter(|(_, entry)| {
                 (now - entry.dispatched_at).num_seconds() >= timeout_secs as i64
             })
-            .map(|(id, entry)| (*id, entry.consumer_id))
+            .map(|(id, entry)| (*id, entry.consumer_id, entry.attempt))
             .collect();
 
-        for (msg_id, consumer_id) in expired {
+        for (msg_id, consumer_id, attempt) in expired {
             self.inflight.remove(&msg_id);
-            if let Some(c) = self.consumers.iter_mut().find(|c| c.id == consumer_id) {
+            if let Some(c) = self.consumers.get_mut(&consumer_id) {
                 c.inflight_count = c.inflight_count.saturating_sub(1);
             }
             self.pending_queue.push_front(msg_id);
-            timed_out.push((consumer_id, msg_id));
+            timed_out.push((consumer_id, msg_id, attempt));
         }
 
         timed_out
+    }
+
+    /// Remove a message from inflight without returning it to pending (for DLQ).
+    pub fn remove_inflight(&mut self, message_id: &MessageId) -> bool {
+        if let Some(entry) = self.inflight.remove(message_id) {
+            if let Some(c) = self.consumers.get_mut(&entry.consumer_id) {
+                c.inflight_count = c.inflight_count.saturating_sub(1);
+            }
+            self.delivery_attempts.remove(message_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a message from the pending queue (for DLQ).
+    pub fn remove_from_pending(&mut self, message_id: &MessageId) {
+        self.pending_queue.retain(|id| id != message_id);
+        self.delivery_attempts.remove(message_id);
+    }
+
+    /// Get the cumulative delivery attempt count for a message.
+    pub fn delivery_attempt_count(&self, message_id: &MessageId) -> u32 {
+        self.delivery_attempts.get(message_id).copied().unwrap_or(0)
     }
 
     pub fn is_acked(&self, message_id: &MessageId) -> bool {
@@ -388,6 +426,7 @@ mod tests {
         let timed_out = topic.check_timeouts(0);
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0].1, msg);
+        assert_eq!(timed_out[0].2, 1); // attempt count
         assert_eq!(topic.inflight_count(), 0);
         assert_eq!(topic.pending_count(), 1);
     }
@@ -436,6 +475,62 @@ mod tests {
 
         // Enqueue same message again — should be skipped
         topic.enqueue(msg);
+        assert_eq!(topic.pending_count(), 0);
+    }
+
+    // ---- Delivery attempts tracking ----
+
+    #[test]
+    fn delivery_attempts_accumulate_across_nack() {
+        let mut topic = Topic::new("attempts-topic");
+        let c = make_consumer();
+        topic.add_consumer(c);
+
+        let msg = make_msg_id();
+        topic.enqueue(msg);
+
+        // First dispatch: attempt 1
+        topic.try_dispatch().unwrap();
+        assert_eq!(topic.delivery_attempt_count(&msg), 1);
+
+        // NACK preserves delivery_attempts
+        topic.nack(&msg);
+        assert_eq!(topic.delivery_attempt_count(&msg), 1);
+
+        // Second dispatch: attempt 2
+        topic.try_dispatch().unwrap();
+        assert_eq!(topic.delivery_attempt_count(&msg), 2);
+
+        // ACK clears delivery_attempts
+        topic.ack(&msg);
+        assert_eq!(topic.delivery_attempt_count(&msg), 0);
+    }
+
+    #[test]
+    fn remove_inflight_for_dlq() {
+        let mut topic = Topic::new("dlq-topic");
+        let c = make_consumer();
+        topic.add_consumer(c);
+
+        let msg = make_msg_id();
+        topic.enqueue(msg);
+        topic.try_dispatch().unwrap();
+        assert_eq!(topic.inflight_count(), 1);
+
+        // remove_inflight should remove without adding to pending
+        assert!(topic.remove_inflight(&msg));
+        assert_eq!(topic.inflight_count(), 0);
+        assert_eq!(topic.pending_count(), 0);
+    }
+
+    #[test]
+    fn remove_from_pending_for_dlq() {
+        let mut topic = Topic::new("dlq-topic");
+        let msg = make_msg_id();
+        topic.enqueue(msg);
+        assert_eq!(topic.pending_count(), 1);
+
+        topic.remove_from_pending(&msg);
         assert_eq!(topic.pending_count(), 0);
     }
 }

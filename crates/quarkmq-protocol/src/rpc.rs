@@ -5,8 +5,15 @@ use crate::message::MessageId;
 
 // --- JSON-RPC 2.0 Base Types ---
 
+const JSONRPC_VERSION: &str = "2.0";
+
+fn default_jsonrpc() -> String {
+    JSONRPC_VERSION.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
+    #[serde(default = "default_jsonrpc")]
     pub jsonrpc: String,
     pub method: String,
     #[serde(default)]
@@ -16,6 +23,7 @@ pub struct JsonRpcRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
+    #[serde(default = "default_jsonrpc")]
     pub jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
@@ -35,7 +43,7 @@ pub struct RpcError {
 impl JsonRpcResponse {
     pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             result: Some(result),
             error: None,
             id,
@@ -44,7 +52,7 @@ impl JsonRpcResponse {
 
     pub fn error(id: Option<serde_json::Value>, code: i32, message: impl Into<String>) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             result: None,
             error: Some(RpcError {
                 code,
@@ -57,7 +65,7 @@ impl JsonRpcResponse {
 
     pub fn notification(method: &str, params: serde_json::Value) -> JsonRpcRequest {
         JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             method: method.to_string(),
             params,
             id: None,
@@ -162,11 +170,43 @@ pub struct ChannelInfo {
     pub name: String,
     pub topics: Vec<String>,
     pub pending_count: usize,
+    #[serde(default)]
+    pub dlq_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListChannelsResult {
     pub channels: Vec<ChannelInfo>,
+}
+
+// --- DLQ types ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDlqParams {
+    pub channel: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DlqMessage {
+    pub message_id: MessageId,
+    pub channel: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListDlqResult {
+    pub messages: Vec<DlqMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryDlqParams {
+    pub channel: String,
+    pub message_id: MessageId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryDlqResult {
+    pub success: bool,
 }
 
 // --- Server Push (notification) ---
@@ -191,7 +231,7 @@ impl MessagePush {
 
     pub fn into_notification(self) -> JsonRpcRequest {
         JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             method: "message".to_string(),
             params: serde_json::to_value(self).unwrap(), // MessagePush is always serializable
             id: None,
@@ -202,9 +242,9 @@ impl MessagePush {
 // --- Helper to parse method params ---
 
 pub fn parse_params<T: serde::de::DeserializeOwned>(
-    params: &serde_json::Value,
+    params: serde_json::Value,
 ) -> Result<T, crate::ProtocolError> {
-    serde_json::from_value(params.clone()).map_err(|e| {
+    serde_json::from_value(params).map_err(|e| {
         crate::ProtocolError::InvalidParams(e.to_string())
     })
 }
@@ -386,7 +426,7 @@ mod tests {
     #[test]
     fn test_parse_params_valid_input() {
         let input = json!({"channel": "ch", "payload": 42});
-        let result: Result<PublishParams, _> = parse_params(&input);
+        let result: Result<PublishParams, _> = parse_params(input);
 
         assert!(result.is_ok());
         let params = result.unwrap();
@@ -397,7 +437,7 @@ mod tests {
     #[test]
     fn test_parse_params_missing_required_field() {
         let input = json!({"channel": "ch"}); // missing "payload"
-        let result: Result<PublishParams, _> = parse_params(&input);
+        let result: Result<PublishParams, _> = parse_params(input);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -411,7 +451,7 @@ mod tests {
     #[test]
     fn test_parse_params_wrong_type() {
         let input = json!("not an object");
-        let result: Result<PublishParams, _> = parse_params(&input);
+        let result: Result<PublishParams, _> = parse_params(input);
 
         assert!(result.is_err());
     }

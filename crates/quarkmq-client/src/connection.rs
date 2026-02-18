@@ -13,11 +13,11 @@ use crate::error::ClientError;
 type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>;
 
 pub struct Connection {
-    outbound_tx: mpsc::UnboundedSender<String>,
+    outbound_tx: mpsc::Sender<String>,
     pending: PendingRequests,
     next_id: AtomicU64,
     /// Receiver for server-push notifications (method="message")
-    pub notification_rx: mpsc::UnboundedReceiver<JsonRpcRequest>,
+    pub notification_rx: mpsc::Receiver<JsonRpcRequest>,
 }
 
 impl Connection {
@@ -28,9 +28,9 @@ impl Connection {
 
         let (mut ws_sink, mut ws_read) = ws_stream.split();
 
-        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(1024);
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
-        let (notification_tx, notification_rx) = mpsc::unbounded_channel::<JsonRpcRequest>();
+        let (notification_tx, notification_rx) = mpsc::channel::<JsonRpcRequest>(1024);
 
         // Write task
         tokio::spawn(async move {
@@ -61,7 +61,7 @@ impl Connection {
                     }
                     // Otherwise treat as notification
                     if let Ok(notif) = serde_json::from_str::<JsonRpcRequest>(text_str) {
-                        let _ = notification_tx.send(notif);
+                        let _ = notification_tx.try_send(notif);
                     }
                 }
             }
@@ -82,7 +82,7 @@ impl Connection {
     ) -> Result<JsonRpcResponse, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: "2.0".into(),
             method: method.to_string(),
             params,
             id: Some(serde_json::Value::Number(id.into())),
@@ -97,7 +97,7 @@ impl Connection {
         }
 
         self.outbound_tx
-            .send(json)
+            .try_send(json)
             .map_err(|_| ClientError::ConnectionClosed)?;
 
         let response = tokio::time::timeout(std::time::Duration::from_secs(10), rx)

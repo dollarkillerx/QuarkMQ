@@ -25,6 +25,7 @@ bytes = "1"
 chitchat = "0.12"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
+tempfile = "3"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
