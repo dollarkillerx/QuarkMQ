@@ -44,6 +44,10 @@ impl Topic {
 
     pub fn add_consumer(&mut self, consumer: Consumer) {
         let id = consumer.id;
+        // H3: Don't add duplicate entries to consumer_order
+        if self.consumers.contains_key(&id) {
+            return;
+        }
         self.consumers.insert(id, consumer);
         self.consumer_order.push(id);
     }
@@ -205,6 +209,16 @@ impl Topic {
 
     pub fn is_acked(&self, message_id: &MessageId) -> bool {
         self.ack_set.contains(message_id)
+    }
+
+    /// H1: Remove a message ID from the ack_set (called when message is fully removed from channel).
+    pub fn clear_ack(&mut self, message_id: &MessageId) {
+        self.ack_set.remove(message_id);
+    }
+
+    /// C2: Set delivery attempts for a message (used during recovery).
+    pub fn set_delivery_attempts(&mut self, message_id: MessageId, count: u32) {
+        self.delivery_attempts.insert(message_id, count);
     }
 
     pub fn inflight_count(&self) -> usize {

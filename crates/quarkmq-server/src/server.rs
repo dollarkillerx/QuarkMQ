@@ -29,16 +29,13 @@ impl Server {
     }
 
     pub async fn run(self, shutdown: tokio::sync::broadcast::Sender<()>) -> anyhow::Result<()> {
-        // Recover persisted channels from storage
-        match self.dispatcher.recover() {
-            Ok(count) => {
-                if count > 0 {
-                    tracing::info!(count, "recovered channels from persistent storage");
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to recover channels from storage");
-            }
+        // Recover persisted channels from storage — fail fast if recovery fails
+        // to prevent overwriting unrecovered data with new writes.
+        let count = self.dispatcher.recover().map_err(|e| {
+            anyhow::anyhow!("failed to recover channels from storage: {e}")
+        })?;
+        if count > 0 {
+            tracing::info!(count, "recovered channels from persistent storage");
         }
 
         let listener = TcpListener::bind(&self.config.server.ws_bind).await?;
@@ -145,8 +142,10 @@ async fn timeout_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let dispatches = dispatcher.check_timeouts();
-                deliver_dispatches(&dispatches, &sessions);
+                match dispatcher.check_timeouts() {
+                    Ok(dispatches) => deliver_dispatches(&dispatches, &sessions),
+                    Err(e) => tracing::error!(error = %e, "timeout check failed"),
+                }
             }
             _ = shutdown.recv() => break,
         }

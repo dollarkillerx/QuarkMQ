@@ -19,6 +19,22 @@ pub struct ChannelConfig {
     pub max_inflight_per_consumer: usize,
 }
 
+impl ChannelConfig {
+    pub fn validate(&self) -> Result<(), BrokerError> {
+        if self.max_delivery_attempts < 1 {
+            return Err(BrokerError::InvalidConfig(
+                "max_delivery_attempts must be >= 1".to_string(),
+            ));
+        }
+        if self.ack_timeout_secs < 1 {
+            return Err(BrokerError::InvalidConfig(
+                "ack_timeout_secs must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for ChannelConfig {
     fn default() -> Self {
         Self {
@@ -47,6 +63,8 @@ pub struct Channel {
     data_dir: Option<PathBuf>,
     /// Message IDs recovered from WAL that need to be enqueued when topics are created.
     recovered_pending: Vec<MessageId>,
+    /// Delivery attempts recovered from WAL Nack records, injected into topics on subscribe.
+    recovered_delivery_attempts: HashMap<MessageId, u32>,
 }
 
 impl Channel {
@@ -59,6 +77,7 @@ impl Channel {
             dlq: Vec::new(),
             data_dir: None,
             recovered_pending: Vec::new(),
+            recovered_delivery_attempts: HashMap::new(),
         }
     }
 
@@ -89,6 +108,7 @@ impl Channel {
             dlq: Vec::new(),
             data_dir: Some(channel_dir),
             recovered_pending: Vec::new(),
+            recovered_delivery_attempts: HashMap::new(),
         })
     }
 
@@ -101,6 +121,7 @@ impl Channel {
         let mut acked: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
         let mut dead_lettered: std::collections::HashSet<MessageId> = std::collections::HashSet::new();
         let mut dlq: Vec<Arc<Message>> = Vec::new();
+        let mut delivery_attempts: HashMap<MessageId, u32> = HashMap::new();
 
         for record in &records {
             match record.operation {
@@ -111,9 +132,18 @@ impl Channel {
                 }
                 WalOperation::Ack => {
                     acked.insert(record.message_id);
+                    delivery_attempts.remove(&record.message_id);
+                }
+                WalOperation::Nack => {
+                    // Recover delivery_attempts from Nack records
+                    if record.data.len() >= 4 {
+                        let count = u32::from_le_bytes(record.data[..4].try_into().unwrap());
+                        delivery_attempts.insert(record.message_id, count);
+                    }
                 }
                 WalOperation::DeadLetter => {
                     dead_lettered.insert(record.message_id);
+                    delivery_attempts.remove(&record.message_id);
                     if let Some(msg) = messages.get(&record.message_id) {
                         dlq.push(msg.clone());
                     }
@@ -134,6 +164,9 @@ impl Channel {
             messages.remove(id);
         }
 
+        // Only keep delivery_attempts for pending messages
+        delivery_attempts.retain(|id, _| recovered_pending.contains(id));
+
         // Open WAL for continued writing
         let wal = Wal::open(&wal_path)?;
 
@@ -153,6 +186,7 @@ impl Channel {
             dlq,
             data_dir: Some(channel_dir.to_path_buf()),
             recovered_pending,
+            recovered_delivery_attempts: delivery_attempts,
         })
     }
 
@@ -191,10 +225,30 @@ impl Channel {
         let consumer = Consumer::new(consumer_id, self.config.max_inflight_per_consumer);
         topic.add_consumer(consumer);
 
-        // When a new topic is created, enqueue any recovered pending messages
-        if is_new_topic && !self.recovered_pending.is_empty() {
-            for &msg_id in &self.recovered_pending {
-                topic.enqueue(msg_id);
+        // H2: When a new topic is created, enqueue current pending messages (not stale recovered_pending).
+        // On first subscribe, use recovered_pending and then clear it.
+        // On subsequent subscribes, use messages.keys() excluding DLQ entries.
+        if is_new_topic {
+            if !self.recovered_pending.is_empty() {
+                for &msg_id in &self.recovered_pending {
+                    topic.enqueue(msg_id);
+                }
+                // C2: Inject recovered delivery_attempts into the topic
+                for (&msg_id, &count) in &self.recovered_delivery_attempts {
+                    topic.set_delivery_attempts(msg_id, count);
+                }
+                self.recovered_pending.clear();
+                self.recovered_delivery_attempts.clear();
+            } else {
+                // For topics created after recovery, enqueue messages still in memory
+                // (excluding those already in DLQ)
+                let dlq_ids: std::collections::HashSet<MessageId> =
+                    self.dlq.iter().map(|m| m.id).collect();
+                for &msg_id in self.messages.keys() {
+                    if !dlq_ids.contains(&msg_id) {
+                        topic.enqueue(msg_id);
+                    }
+                }
             }
         }
     }
@@ -267,9 +321,13 @@ impl Channel {
         if all_acked {
             // WAL: record ack
             if let Some(wal) = &mut self.wal {
-                let _ = wal.append(WalOperation::Ack, *message_id, vec![]);
+                wal.append(WalOperation::Ack, *message_id, vec![])?;
             }
             self.messages.remove(message_id);
+            // H1: Clean ack_set entries now that message is fully acked and removed
+            for topic in self.topics.values_mut() {
+                topic.clear_ack(message_id);
+            }
         }
 
         Ok(())
@@ -286,7 +344,7 @@ impl Channel {
         for topic in self.topics.values() {
             let attempts = topic.delivery_attempt_count(message_id);
             if attempts >= max_attempts {
-                self.dead_letter_internal(message_id);
+                self.dead_letter_internal(message_id)?;
                 return Ok(());
             }
         }
@@ -303,11 +361,20 @@ impl Channel {
             return Err(BrokerError::MessageNotInflight(*message_id));
         }
 
+        // C2: Write Nack WAL record to persist delivery_attempts
+        if let Some(wal) = &mut self.wal {
+            let attempt_count = self.topics.values()
+                .map(|t| t.delivery_attempt_count(message_id))
+                .max()
+                .unwrap_or(0);
+            wal.append(WalOperation::Nack, *message_id, attempt_count.to_le_bytes().to_vec())?;
+        }
+
         Ok(())
     }
 
     /// Check for ACK timeouts across all topics.
-    pub fn check_timeouts(&mut self) -> Vec<Dispatch> {
+    pub fn check_timeouts(&mut self) -> Result<Vec<Dispatch>, BrokerError> {
         let mut dispatches = Vec::new();
         let timeout = self.config.ack_timeout_secs;
         let max_attempts = self.config.max_delivery_attempts;
@@ -331,16 +398,16 @@ impl Channel {
 
         // Dead-letter messages that exceeded max attempts
         for msg_id in to_dead_letter {
-            self.dead_letter_internal(&msg_id);
+            self.dead_letter_internal(&msg_id)?;
         }
 
         // After returning to pending, try to re-dispatch
         dispatches.extend(self.dispatch());
-        dispatches
+        Ok(dispatches)
     }
 
     /// Move a message to the dead-letter queue.
-    fn dead_letter_internal(&mut self, message_id: &MessageId) {
+    fn dead_letter_internal(&mut self, message_id: &MessageId) -> Result<(), BrokerError> {
         // Remove from all topics (inflight or pending)
         for topic in self.topics.values_mut() {
             topic.remove_inflight(message_id);
@@ -349,7 +416,7 @@ impl Channel {
 
         // WAL: record dead-letter
         if let Some(wal) = &mut self.wal {
-            let _ = wal.append(WalOperation::DeadLetter, *message_id, vec![]);
+            wal.append(WalOperation::DeadLetter, *message_id, vec![])?;
         }
 
         // Move to DLQ
@@ -360,6 +427,7 @@ impl Channel {
             );
             self.dlq.push(msg);
         }
+        Ok(())
     }
 
     pub fn sync_wal(&mut self) -> Result<(), BrokerError> {
@@ -437,6 +505,21 @@ impl Channel {
                     data,
                 ));
                 seq += 1;
+
+                // C2: Write Nack records for messages with delivery_attempts
+                let max_attempts = self.topics.values()
+                    .map(|t| t.delivery_attempt_count(id))
+                    .max()
+                    .unwrap_or(0);
+                if max_attempts > 0 {
+                    records.push(quarkmq_storage::WalRecord::new(
+                        seq,
+                        WalOperation::Nack,
+                        *id,
+                        max_attempts.to_le_bytes().to_vec(),
+                    ));
+                    seq += 1;
+                }
             }
             // DLQ messages: write Append first (for recovery to rebuild message body),
             // then DeadLetter to mark them as dead-lettered.
@@ -802,7 +885,7 @@ mod tests {
         ch.dispatch();
 
         // Check timeouts — message at limit, should dead-letter
-        ch.check_timeouts();
+        ch.check_timeouts().unwrap();
 
         assert_eq!(ch.dlq_count(), 1);
         assert!(ch.get_message(&msg_id).is_none());

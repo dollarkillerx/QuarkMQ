@@ -57,6 +57,9 @@ impl Dispatcher {
     }
 
     pub fn create_channel(&self, config: ChannelConfig) -> Result<(), BrokerError> {
+        // M5: Validate channel config
+        config.validate()?;
+
         use dashmap::mapref::entry::Entry;
         let name = config.name.clone();
         match self.channels.entry(name) {
@@ -80,7 +83,13 @@ impl Dispatcher {
             Some((_, channel)) => {
                 // Delete channel directory if it exists
                 if let Some(dir) = channel.data_dir() {
-                    let _ = std::fs::remove_dir_all(dir);
+                    if let Err(e) = std::fs::remove_dir_all(dir) {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            error = %e,
+                            "failed to remove channel directory, may be recovered on restart"
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -128,10 +137,15 @@ impl Dispatcher {
         }
 
         let mut subs = self.subscriptions.write();
-        subs.entry(consumer_id).or_default().push(Subscription {
-            channel: channel_name.to_string(),
-            topic: topic_name.to_string(),
-        });
+        let sub_list = subs.entry(consumer_id).or_default();
+        // H3: Don't add duplicate subscriptions
+        let already_subscribed = sub_list.iter().any(|s| s.channel == channel_name && s.topic == topic_name);
+        if !already_subscribed {
+            sub_list.push(Subscription {
+                channel: channel_name.to_string(),
+                topic: topic_name.to_string(),
+            });
+        }
 
         Ok(())
     }
@@ -229,12 +243,12 @@ impl Dispatcher {
 
     /// Check ACK timeouts across all channels. Returns dispatches to re-send.
     /// Each channel is locked individually.
-    pub fn check_timeouts(&self) -> Vec<Dispatch> {
+    pub fn check_timeouts(&self) -> Result<Vec<Dispatch>, BrokerError> {
         let mut all_dispatches = Vec::new();
         for mut entry in self.channels.iter_mut() {
-            all_dispatches.extend(entry.value_mut().check_timeouts());
+            all_dispatches.extend(entry.value_mut().check_timeouts()?);
         }
-        all_dispatches
+        Ok(all_dispatches)
     }
 
     /// Recover all channels from persistent storage.

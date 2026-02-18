@@ -13,6 +13,8 @@ use crate::StorageError;
 /// Total header: 8 + 1 + 16 + 4 = 29 bytes + data + 4 bytes CRC
 const RECORD_HEADER_SIZE: usize = 8 + 1 + 16 + 4; // 29 bytes
 const CRC_SIZE: usize = 4;
+/// Maximum allowed data length per WAL record (64 MB).
+const MAX_RECORD_DATA_LEN: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -105,6 +107,11 @@ impl WalRecord {
         })?;
         let message_id = Uuid::from_bytes(header[9..25].try_into().unwrap());
         let data_len = u32::from_le_bytes(header[25..29].try_into().unwrap()) as usize;
+
+        // H4: Reject unreasonably large data_len to prevent OOM from corrupt WAL
+        if data_len > MAX_RECORD_DATA_LEN {
+            return Err(StorageError::CorruptRecord { offset: 0 });
+        }
 
         // Read data
         let mut data = vec![0u8; data_len];
@@ -240,7 +247,7 @@ impl Wal {
     /// Truncate and rewrite the WAL with only the given records.
     pub fn compact(&mut self, records: &[WalRecord]) -> Result<(), StorageError> {
         // Write to a temp file first
-        let tmp_path = self.path.with_extension("wal.tmp");
+        let tmp_path = self.path.with_extension("qmq.tmp");
         {
             let file = std::fs::File::create(&tmp_path)?;
             let mut writer = BufWriter::new(file);

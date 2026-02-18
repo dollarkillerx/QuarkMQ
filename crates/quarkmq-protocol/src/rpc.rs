@@ -230,10 +230,17 @@ impl MessagePush {
     }
 
     pub fn into_notification(self) -> JsonRpcRequest {
+        let params = match serde_json::to_value(&self) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("BUG: failed to serialize MessagePush: {e}");
+                serde_json::Value::Null
+            }
+        };
         JsonRpcRequest {
             jsonrpc: JSONRPC_VERSION.to_string(),
             method: "message".to_string(),
-            params: serde_json::to_value(self).unwrap(), // MessagePush is always serializable
+            params,
             id: None,
         }
     }

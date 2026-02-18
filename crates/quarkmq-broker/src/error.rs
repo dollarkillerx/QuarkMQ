@@ -23,6 +23,9 @@ pub enum BrokerError {
     #[error("message dead-lettered: {0}")]
     MessageDeadLettered(uuid::Uuid),
 
+    #[error("invalid channel config: {0}")]
+    InvalidConfig(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] quarkmq_storage::StorageError),
 

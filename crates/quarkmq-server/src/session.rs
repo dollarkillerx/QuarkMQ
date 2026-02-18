@@ -246,6 +246,7 @@ impl Session {
             BrokerError::MessageNotFound(_) => (rpc::MESSAGE_NOT_FOUND, error.to_string()),
             BrokerError::MessageNotInflight(_) => (rpc::MESSAGE_NOT_FOUND, error.to_string()),
             BrokerError::MessageDeadLettered(_) => (rpc::MESSAGE_NOT_FOUND, error.to_string()),
+            BrokerError::InvalidConfig(_) => (rpc::INVALID_PARAMS, error.to_string()),
             BrokerError::Storage(_) => (rpc::INTERNAL_ERROR, error.to_string()),
             _ => (rpc::INTERNAL_ERROR, error.to_string()),
         };
@@ -328,7 +329,11 @@ pub async fn run_session(
     }
 
     tracing::info!(consumer_id = %consumer_id, "session disconnected");
+    // Remove session sender first — this drops the sender in the sessions map.
     sessions.remove(&consumer_id);
     dispatcher.disconnect_consumer(consumer_id);
-    write_task.abort();
+    // Drop the session (and its outbound_tx clone) so the write_task's rx returns None
+    // and exits gracefully, draining any buffered messages.
+    drop(session);
+    let _ = write_task.await;
 }
