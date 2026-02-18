@@ -2,18 +2,14 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("IO error: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("CRC mismatch: expected {expected}, got {actual}")]
-    CrcMismatch { expected: u32, actual: u32 },
-
-    #[error("corrupt WAL record at offset {offset}")]
-    CorruptRecord { offset: u64 },
-
-    #[error("segment full")]
-    SegmentFull,
-
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("corrupt segment: {0}")]
+    Corrupt(String),
+    #[error("offset out of range: {0}")]
+    OffsetOutOfRange(i64),
+    #[error("invalid record batch: {0}")]
+    InvalidRecordBatch(String),
 }
+
+pub type Result<T> = std::result::Result<T, StorageError>;

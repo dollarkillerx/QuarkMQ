@@ -4,16 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-quarkmq-protocol = { workspace = true }
-tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-crc32fast = { workspace = true }
 bytes = { workspace = true }
+crc32fast = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

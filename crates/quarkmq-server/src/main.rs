@@ -1,21 +1,10 @@
-mod config;
-mod error;
-mod server;
-mod session;
-
+use std::sync::Arc;
 use clap::Parser;
+use tracing::info;
 
-#[derive(Parser)]
-#[command(name = "quarkmq", version, about = "QuarkMQ - Lightweight Message Queue")]
-struct Cli {
-    /// Path to config file
-    #[arg(short, long)]
-    config: Option<String>,
-
-    /// WebSocket bind address (overrides config)
-    #[arg(long)]
-    bind: Option<String>,
-}
+use quarkmq_server::config::{CliArgs, ServerConfig};
+use quarkmq_server::server::Server;
+use quarkmq_broker::Broker;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,34 +15,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let args = CliArgs::parse();
+    let config = ServerConfig::load(&args)?;
 
-    let mut config = config::Config::load(cli.config.as_deref())?;
+    info!(
+        "Starting QuarkMQ node_id={} data_dir={} bind={}",
+        config.broker_config.node_id, config.broker_config.data_dir, config.bind
+    );
 
-    if let Some(bind) = cli.bind {
-        config.server.ws_bind = bind;
-    }
+    let broker = Broker::new(config.broker_config);
+    broker.start()?;
 
-    // Environment variable overrides
-    if let Ok(bind) = std::env::var("QUARKMQ_WS_BIND") {
-        config.server.ws_bind = bind;
-    }
-    if let Ok(id) = std::env::var("QUARKMQ_NODE_ID") {
-        config.node.id = id;
-    }
+    info!("Broker started, recovered state from disk");
 
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let broker = Arc::new(broker);
+    let server = Server::bind(&config.bind, broker).await?;
+    server.run().await?;
 
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("received Ctrl+C, initiating shutdown");
-        let _ = shutdown_tx_clone.send(());
-    });
-
-    let server = server::Server::new(config);
-    server.run(shutdown_tx).await?;
-
-    tracing::info!("QuarkMQ server stopped");
     Ok(())
 }

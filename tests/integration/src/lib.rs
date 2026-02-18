@@ -1,1 +1,1 @@
-// Integration tests are in the tests/ directory
+// Integration test helpers

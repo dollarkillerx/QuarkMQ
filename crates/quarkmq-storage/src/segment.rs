@@ -1,357 +1,489 @@
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::wal::WalRecord;
-use crate::StorageError;
+use crate::error::{Result, StorageError};
+use crate::offset_index::OffsetIndex;
+use crate::record_batch;
+use crate::time_index::TimeIndex;
 
-/// A single segment file containing WAL records.
-/// Keeps the file descriptor open for writes to avoid re-opening on every append.
+/// A Segment manages a single .log file and its .index and .timeindex files.
+///
+/// The .log file stores raw RecordBatch bytes sequentially. The .index and
+/// .timeindex files are sparse indexes that map offsets and timestamps to
+/// file positions in the .log file.
 pub struct Segment {
-    path: PathBuf,
-    id: u64,
-    max_size: u64,
-    current_size: u64,
-    sealed: bool,
-    writer: Option<BufWriter<std::fs::File>>,
+    base_offset: i64,
+    next_offset: i64,
+    dir: PathBuf,
+    writer: BufWriter<File>,
+    size: u64,
+    offset_index: OffsetIndex,
+    time_index: TimeIndex,
+    bytes_since_last_index: u64,
+    index_interval_bytes: u64,
 }
 
 impl Segment {
-    pub fn create(dir: &Path, id: u64, max_size: u64) -> Result<Self, StorageError> {
-        let path = Self::segment_path(dir, id);
-        let file = std::fs::OpenOptions::new()
+    /// Create a new empty segment at `base_offset` within `dir`.
+    pub fn new(dir: &Path, base_offset: i64, index_interval_bytes: u64) -> Result<Self> {
+        let log_path = dir.join(segment_file_name(base_offset, "log"));
+        let index_path = dir.join(segment_file_name(base_offset, "index"));
+        let timeindex_path = dir.join(segment_file_name(base_offset, "timeindex"));
+
+        let file = OpenOptions::new()
             .create(true)
-            .append(true)
-            .open(&path)?;
+            .truncate(true)
+            .write(true)
+            .append(false)
+            .open(&log_path)?;
+        let writer = BufWriter::new(file);
+
+        let offset_index = OffsetIndex::new(&index_path, base_offset)?;
+        let time_index = TimeIndex::new(&timeindex_path, base_offset)?;
+
         Ok(Self {
-            path,
-            id,
-            max_size,
-            current_size: 0,
-            sealed: false,
-            writer: Some(BufWriter::new(file)),
+            base_offset,
+            next_offset: base_offset,
+            dir: dir.to_path_buf(),
+            writer,
+            size: 0,
+            offset_index,
+            time_index,
+            bytes_since_last_index: 0,
+            index_interval_bytes,
         })
     }
 
-    pub fn open(path: impl AsRef<Path>, id: u64, max_size: u64) -> Result<Self, StorageError> {
-        let path = path.as_ref().to_path_buf();
-        let metadata = std::fs::metadata(&path)?;
-        let current_size = metadata.len();
-        let sealed = current_size >= max_size;
+    /// Open an existing segment and recover state by scanning the .log file.
+    pub fn open(dir: &Path, base_offset: i64, index_interval_bytes: u64) -> Result<Self> {
+        let log_path = dir.join(segment_file_name(base_offset, "log"));
+        let index_path = dir.join(segment_file_name(base_offset, "index"));
+        let timeindex_path = dir.join(segment_file_name(base_offset, "timeindex"));
 
-        let writer = if !sealed {
-            let file = std::fs::OpenOptions::new().append(true).open(&path)?;
-            Some(BufWriter::new(file))
+        // Read the entire log file to recover next_offset and size.
+        let mut reader = File::open(&log_path)?;
+        let file_len = reader.metadata()?.len();
+        let mut buf = vec![0u8; file_len as usize];
+        reader.read_exact(&mut buf)?;
+
+        let mut next_offset = base_offset;
+        let mut pos: usize = 0;
+
+        while pos + record_batch::RECORD_BATCH_HEADER_SIZE <= buf.len() {
+            let batch_slice = &buf[pos..];
+            let batch_length = record_batch::get_batch_length(batch_slice);
+            if batch_length < 0 {
+                return Err(StorageError::Corrupt(format!(
+                    "negative batch length {} at position {}",
+                    batch_length, pos
+                )));
+            }
+            let total_size = 12 + batch_length as usize;
+            if pos + total_size > buf.len() {
+                // Truncated batch at end of file; treat as end.
+                break;
+            }
+            let record_count = record_batch::get_record_count(&batch_slice[..total_size])?;
+            let batch_base = record_batch::get_batch_base_offset(batch_slice);
+            next_offset = batch_base + record_count as i64;
+            pos += total_size;
+        }
+
+        let size = pos as u64;
+
+        // Open log file for appending (seek to end).
+        let file = OpenOptions::new().append(true).open(&log_path)?;
+        let writer = BufWriter::new(file);
+
+        // Open indexes (recover from disk).
+        let offset_index = if index_path.exists() {
+            OffsetIndex::open(&index_path, base_offset)?
         } else {
-            None
+            OffsetIndex::new(&index_path, base_offset)?
+        };
+        let time_index = if timeindex_path.exists() {
+            TimeIndex::open(&timeindex_path, base_offset)?
+        } else {
+            TimeIndex::new(&timeindex_path, base_offset)?
         };
 
         Ok(Self {
-            path,
-            id,
-            max_size,
-            current_size,
-            sealed,
+            base_offset,
+            next_offset,
+            dir: dir.to_path_buf(),
             writer,
+            size,
+            offset_index,
+            time_index,
+            bytes_since_last_index: 0,
+            index_interval_bytes,
         })
     }
 
-    pub fn segment_path(dir: &Path, id: u64) -> PathBuf {
-        dir.join(format!("segment-{:06}.qmq", id))
+    /// Append a record batch. Returns `(base_offset_for_batch, next_offset_after)`.
+    ///
+    /// The batch bytes will have their base_offset rewritten to the current
+    /// `next_offset` of this segment.
+    pub fn append(&mut self, batch: &mut [u8], record_count: i32) -> Result<(i64, i64)> {
+        let batch_base = self.next_offset;
+        record_batch::set_batch_base_offset(batch, batch_base);
+
+        let position = self.size as u32;
+        self.writer.write_all(batch)?;
+
+        let batch_size = batch.len() as u64;
+        self.size += batch_size;
+
+        // Update sparse index if enough bytes have accumulated.
+        if self.bytes_since_last_index >= self.index_interval_bytes {
+            self.offset_index.append(batch_base, position)?;
+            let timestamp = record_batch::get_first_timestamp(batch);
+            self.time_index.append(timestamp, batch_base)?;
+            self.bytes_since_last_index = 0;
+        }
+        self.bytes_since_last_index += batch_size;
+
+        self.next_offset = batch_base + record_count as i64;
+        Ok((batch_base, self.next_offset))
     }
 
-    pub fn append_record(&mut self, record: &WalRecord) -> Result<u64, StorageError> {
-        if self.sealed {
-            return Err(StorageError::SegmentFull);
+    /// Read raw bytes starting from `start_offset`, up to `max_bytes`.
+    ///
+    /// Returns the raw bytes (RecordBatch data) that can be sent directly to a client.
+    /// If `start_offset` falls within a batch (not at a batch boundary), the entire
+    /// batch containing that offset is returned.
+    pub fn read(&mut self, start_offset: i64, max_bytes: usize) -> Result<Vec<u8>> {
+        // Flush buffered writes so the file on disk is up to date.
+        self.writer.flush()?;
+        if start_offset >= self.next_offset {
+            return Err(StorageError::OffsetOutOfRange(start_offset));
+        }
+        if start_offset < self.base_offset {
+            return Err(StorageError::OffsetOutOfRange(start_offset));
         }
 
-        let encoded = record.encode();
-        let record_size = encoded.len() as u64;
+        let log_path = self.dir.join(segment_file_name(self.base_offset, "log"));
+        let mut reader = File::open(&log_path)?;
 
-        if self.current_size + record_size > self.max_size {
-            self.sealed = true;
-            self.writer = None;
-            return Err(StorageError::SegmentFull);
-        }
+        // Use the offset index to find a starting position.
+        let seek_pos = self.offset_index.lookup(start_offset).unwrap_or(0);
+        reader.seek(SeekFrom::Start(seek_pos as u64))?;
 
-        let writer = self.writer.as_mut().ok_or_else(|| {
-            StorageError::Io(io::Error::other("segment writer not open"))
-        })?;
-        let offset = self.current_size;
-        writer.write_all(&encoded)?;
-        writer.flush()?;
-        self.current_size += record_size;
+        // Read from seek_pos to end of file into a buffer.
+        let remaining = self.size - seek_pos as u64;
+        let mut buf = vec![0u8; remaining as usize];
+        reader.read_exact(&mut buf)?;
 
-        Ok(offset)
-    }
+        // Scan forward through batches to find the one containing start_offset.
+        let mut scan_pos: usize = 0;
+        let mut result = Vec::new();
+        let mut found = false;
 
-    pub fn read_record_at(&self, offset: u64) -> Result<WalRecord, StorageError> {
-        let file = std::fs::File::open(&self.path)?;
-        let mut reader = io::BufReader::new(file);
-        reader.seek(SeekFrom::Start(offset))?;
-        WalRecord::decode(&mut reader)?.ok_or(StorageError::CorruptRecord { offset })
-    }
+        while scan_pos + record_batch::RECORD_BATCH_HEADER_SIZE <= buf.len() {
+            let batch_slice = &buf[scan_pos..];
+            let batch_length = record_batch::get_batch_length(batch_slice);
+            if batch_length < 0 {
+                break;
+            }
+            let total_size = 12 + batch_length as usize;
+            if scan_pos + total_size > buf.len() {
+                break;
+            }
 
-    pub fn read_all_records(&self) -> Result<Vec<WalRecord>, StorageError> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = std::fs::File::open(&self.path)?;
-        let mut reader = io::BufReader::new(file);
-        let mut records = Vec::new();
+            let batch_base = record_batch::get_batch_base_offset(batch_slice);
+            let record_count =
+                record_batch::get_record_count(&batch_slice[..total_size])?;
+            let batch_end_offset = batch_base + record_count as i64;
 
-        loop {
-            match WalRecord::decode(&mut reader) {
-                Ok(Some(record)) => records.push(record),
-                Ok(None) => break,
-                Err(StorageError::CrcMismatch { .. }) => {
-                    tracing::warn!(segment_id = self.id, "CRC mismatch in segment, stopping read");
+            // This batch contains start_offset if batch_base <= start_offset < batch_end_offset.
+            // Or this batch starts at or after start_offset.
+            if batch_end_offset > start_offset {
+                if !found {
+                    found = true;
+                }
+                if result.len() + total_size > max_bytes && !result.is_empty() {
+                    // Adding this batch would exceed max_bytes and we already have data.
                     break;
                 }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(records)
-    }
-
-    pub fn is_sealed(&self) -> bool {
-        self.sealed
-    }
-
-    pub fn seal(&mut self) {
-        self.sealed = true;
-        self.writer = None;
-    }
-
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    pub fn current_size(&self) -> u64 {
-        self.current_size
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Manages multiple segments for a channel.
-pub struct SegmentManager {
-    dir: PathBuf,
-    segments: Vec<Segment>,
-    max_segment_size: u64,
-    next_segment_id: u64,
-}
-
-impl SegmentManager {
-    pub fn open(dir: impl AsRef<Path>, max_segment_size_mb: u64) -> Result<Self, StorageError> {
-        let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
-
-        let max_segment_size = max_segment_size_mb * 1024 * 1024;
-        let mut segments = Vec::new();
-
-        // Scan for existing segment files
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("segment-") && n.ends_with(".qmq"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-
-        let mut next_id = 1u64;
-        for entry in entries {
-            let fname = entry.file_name();
-            let name = fname.to_str().unwrap_or("");
-            if let Some(id_str) = name.strip_prefix("segment-").and_then(|s| s.strip_suffix(".qmq"))
-            {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    let segment = Segment::open(entry.path(), id, max_segment_size)?;
-                    next_id = id + 1;
-                    segments.push(segment);
+                result.extend_from_slice(&buf[scan_pos..scan_pos + total_size]);
+                if result.len() >= max_bytes {
+                    break;
                 }
             }
+            scan_pos += total_size;
         }
 
-        Ok(Self {
-            dir,
-            segments,
-            max_segment_size,
-            next_segment_id: next_id,
-        })
+        Ok(result)
     }
 
-    /// Append a record. Creates a new segment if the current one is full.
-    pub fn append(&mut self, record: &WalRecord) -> Result<(u64, u64), StorageError> {
-        // Try the current (last) segment first
-        if let Some(segment) = self.segments.last_mut() {
-            match segment.append_record(record) {
-                Ok(offset) => return Ok((segment.id(), offset)),
-                Err(StorageError::SegmentFull) => {
-                    segment.seal();
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Create a new segment
-        let new_segment = Segment::create(&self.dir, self.next_segment_id, self.max_segment_size)?;
-        self.next_segment_id += 1;
-        self.segments.push(new_segment);
-
-        let segment = self.segments.last_mut().unwrap();
-        let offset = segment.append_record(record)?;
-        Ok((segment.id(), offset))
+    pub fn base_offset(&self) -> i64 {
+        self.base_offset
     }
 
-    /// Read a record by segment_id and offset.
-    pub fn read(&self, segment_id: u64, offset: u64) -> Result<WalRecord, StorageError> {
-        let segment = self
-            .segments
-            .iter()
-            .find(|s| s.id() == segment_id)
-            .ok_or(StorageError::CorruptRecord { offset })?;
-        segment.read_record_at(offset)
+    pub fn next_offset(&self) -> i64 {
+        self.next_offset
     }
 
-    /// Read all records from all segments.
-    pub fn read_all(&self) -> Result<Vec<WalRecord>, StorageError> {
-        let mut all_records = Vec::new();
-        for segment in &self.segments {
-            all_records.extend(segment.read_all_records()?);
-        }
-        Ok(all_records)
+    pub fn size(&self) -> u64 {
+        self.size
     }
 
-    /// Remove empty or fully-GC'd segments.
-    pub fn remove_segment(&mut self, segment_id: u64) -> Result<(), StorageError> {
-        if let Some(pos) = self.segments.iter().position(|s| s.id() == segment_id) {
-            let segment = &self.segments[pos];
-            if segment.path().exists() {
-                std::fs::remove_file(segment.path())?;
-            }
-            self.segments.remove(pos);
-        }
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        self.offset_index.flush()?;
+        self.time_index.flush()?;
         Ok(())
     }
+}
 
-    pub fn segment_count(&self) -> usize {
-        self.segments.len()
-    }
+/// Format offset as 20-digit zero-padded string with the given extension.
+fn segment_file_name(base_offset: i64, ext: &str) -> String {
+    format!("{:020}.{}", base_offset, ext)
+}
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
+/// Parse a base offset from a segment filename (e.g. "00000000000000000000.log").
+pub fn parse_base_offset(filename: &str) -> Option<i64> {
+    let stem = filename.split('.').next()?;
+    stem.parse::<i64>().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::{WalOperation, WalRecord};
+    use crate::record_batch;
     use tempfile::tempdir;
-    use uuid::Uuid;
 
-    #[test]
-    fn test_segment_create_and_append() {
-        let dir = tempdir().unwrap();
-        let mut segment = Segment::create(dir.path(), 1, 1024 * 1024).unwrap();
-
-        let record = WalRecord::new(1, WalOperation::Append, Uuid::now_v7(), b"hello".to_vec());
-        let offset = segment.append_record(&record).unwrap();
-        assert_eq!(offset, 0);
-
-        let record2 = WalRecord::new(2, WalOperation::Append, Uuid::now_v7(), b"world".to_vec());
-        let offset2 = segment.append_record(&record2).unwrap();
-        assert!(offset2 > 0);
+    /// Build a minimal valid RecordBatch with the given parameters.
+    fn make_batch(
+        base_offset: i64,
+        first_ts: i64,
+        max_ts: i64,
+        record_count: i32,
+    ) -> Vec<u8> {
+        // batch_length = 49 (minimum: 61 header - 12 prefix)
+        let batch_length: i32 = 49;
+        let total = 12 + batch_length as usize;
+        let mut buf = vec![0u8; total];
+        // base_offset: bytes 0..8
+        buf[0..8].copy_from_slice(&base_offset.to_be_bytes());
+        // batch_length: bytes 8..12
+        buf[8..12].copy_from_slice(&batch_length.to_be_bytes());
+        // magic: byte 16
+        buf[16] = 2;
+        // first_timestamp: bytes 25..33
+        buf[25..33].copy_from_slice(&first_ts.to_be_bytes());
+        // max_timestamp: bytes 33..41
+        buf[33..41].copy_from_slice(&max_ts.to_be_bytes());
+        // record_count: bytes 57..61
+        buf[57..61].copy_from_slice(&record_count.to_be_bytes());
+        buf
     }
 
     #[test]
-    fn test_segment_read_back() {
+    fn test_new_segment() {
         let dir = tempdir().unwrap();
-        let msg_id = Uuid::now_v7();
-        let mut segment = Segment::create(dir.path(), 1, 1024 * 1024).unwrap();
-
-        let record = WalRecord::new(1, WalOperation::Append, msg_id, b"test data".to_vec());
-        let offset = segment.append_record(&record).unwrap();
-
-        let read_back = segment.read_record_at(offset).unwrap();
-        assert_eq!(read_back.message_id, msg_id);
-        assert_eq!(read_back.data, b"test data");
+        let seg = Segment::new(dir.path(), 0, 4096).unwrap();
+        assert_eq!(seg.base_offset(), 0);
+        assert_eq!(seg.next_offset(), 0);
+        assert_eq!(seg.size(), 0);
     }
 
     #[test]
-    fn test_segment_full() {
+    fn test_append_single_batch() {
         let dir = tempdir().unwrap();
-        let mut segment = Segment::create(dir.path(), 1, 100).unwrap(); // Very small segment
+        let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
 
-        let record = WalRecord::new(1, WalOperation::Append, Uuid::now_v7(), vec![0u8; 80]);
-        let result = segment.append_record(&record);
-        // First record may or may not fit depending on header overhead
-        // The point is that eventually it should return SegmentFull
-        if result.is_ok() {
-            let record2 = WalRecord::new(2, WalOperation::Append, Uuid::now_v7(), vec![0u8; 80]);
-            let result2 = segment.append_record(&record2);
-            assert!(matches!(result2, Err(StorageError::SegmentFull)));
+        let mut batch = make_batch(0, 1000, 1000, 3);
+        let (base, next) = seg.append(&mut batch, 3).unwrap();
+        seg.flush().unwrap();
+
+        assert_eq!(base, 0);
+        assert_eq!(next, 3);
+        assert_eq!(seg.next_offset(), 3);
+        assert_eq!(seg.size(), 61);
+    }
+
+    #[test]
+    fn test_append_multiple_batches() {
+        let dir = tempdir().unwrap();
+        let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
+
+        let mut batch1 = make_batch(0, 1000, 1000, 2);
+        let (b1, n1) = seg.append(&mut batch1, 2).unwrap();
+        assert_eq!(b1, 0);
+        assert_eq!(n1, 2);
+
+        let mut batch2 = make_batch(0, 2000, 2000, 3);
+        let (b2, n2) = seg.append(&mut batch2, 3).unwrap();
+        assert_eq!(b2, 2);
+        assert_eq!(n2, 5);
+
+        seg.flush().unwrap();
+        assert_eq!(seg.next_offset(), 5);
+        assert_eq!(seg.size(), 122); // 61 * 2
+    }
+
+    #[test]
+    fn test_read_single_batch() {
+        let dir = tempdir().unwrap();
+        let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
+
+        let mut batch = make_batch(0, 1000, 1000, 3);
+        seg.append(&mut batch, 3).unwrap();
+        seg.flush().unwrap();
+
+        let data = seg.read(0, 4096).unwrap();
+        assert_eq!(data.len(), 61);
+        assert_eq!(record_batch::get_batch_base_offset(&data), 0);
+        assert_eq!(record_batch::get_record_count(&data).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_read_from_middle_offset() {
+        let dir = tempdir().unwrap();
+        let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
+
+        let mut batch1 = make_batch(0, 1000, 1000, 5);
+        seg.append(&mut batch1, 5).unwrap();
+
+        let mut batch2 = make_batch(0, 2000, 2000, 5);
+        seg.append(&mut batch2, 5).unwrap();
+
+        seg.flush().unwrap();
+
+        // Read starting from offset 5 (second batch).
+        let data = seg.read(5, 4096).unwrap();
+        assert_eq!(data.len(), 61);
+        assert_eq!(record_batch::get_batch_base_offset(&data), 5);
+    }
+
+    #[test]
+    fn test_read_offset_within_batch() {
+        let dir = tempdir().unwrap();
+        let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
+
+        // Batch with 5 records, offsets 0..4
+        let mut batch = make_batch(0, 1000, 1000, 5);
+        seg.append(&mut batch, 5).unwrap();
+        seg.flush().unwrap();
+
+        // Read at offset 3 should still return the whole batch.
+        let data = seg.read(3, 4096).unwrap();
+        assert_eq!(data.len(), 61);
+        assert_eq!(record_batch::get_batch_base_offset(&data), 0);
+    }
+
+    #[test]
+    fn test_read_with_max_bytes_limit() {
+        let dir = tempdir().unwrap();
+        let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
+
+        for _ in 0..5 {
+            let mut batch = make_batch(0, 1000, 1000, 1);
+            seg.append(&mut batch, 1).unwrap();
         }
+        seg.flush().unwrap();
+
+        // Read from offset 0 with max_bytes = 100 (one batch is 61 bytes).
+        let data = seg.read(0, 100).unwrap();
+        // Should get exactly one batch (61 bytes) since 61 < 100 but 61+61=122 > 100.
+        assert_eq!(data.len(), 61);
     }
 
     #[test]
-    fn test_segment_manager_auto_rollover() {
+    fn test_read_offset_out_of_range() {
         let dir = tempdir().unwrap();
-        let data_dir = dir.path().join("segments");
+        let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
 
-        // Use a very small segment size to force rollover
-        let mut mgr = SegmentManager::open(&data_dir, 0).unwrap();
-        // max_segment_size = 0 MB, but minimum is 0 bytes, so every append creates a new segment
-        // Actually let's use a reasonable small size
-        drop(mgr);
+        let mut batch = make_batch(0, 1000, 1000, 3);
+        seg.append(&mut batch, 3).unwrap();
+        seg.flush().unwrap();
 
-        // Recreate with a custom tiny max
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let mut mgr = SegmentManager {
-            dir: data_dir.clone(),
-            segments: Vec::new(),
-            max_segment_size: 100, // 100 bytes
-            next_segment_id: 1,
-        };
-
-        // Append records until we get multiple segments
-        for i in 1..=5 {
-            let record = WalRecord::new(i, WalOperation::Append, Uuid::now_v7(), vec![0u8; 30]);
-            mgr.append(&record).unwrap();
-        }
-
-        assert!(mgr.segment_count() > 1, "expected multiple segments due to rollover");
+        assert!(seg.read(3, 4096).is_err());
+        assert!(seg.read(-1, 4096).is_err());
     }
 
     #[test]
-    fn test_segment_manager_read_all() {
+    fn test_open_recovery() {
         let dir = tempdir().unwrap();
-        let data_dir = dir.path().join("segments");
 
-        let mut mgr = SegmentManager::open(&data_dir, 1).unwrap(); // 1MB segments
-
-        let ids: Vec<_> = (0..3).map(|_| Uuid::now_v7()).collect();
-        for (i, id) in ids.iter().enumerate() {
-            let record = WalRecord::new(
-                (i + 1) as u64,
-                WalOperation::Append,
-                *id,
-                format!("msg-{}", i).into_bytes(),
-            );
-            mgr.append(&record).unwrap();
+        // Create segment and write batches.
+        {
+            let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
+            let mut batch1 = make_batch(0, 1000, 1000, 3);
+            seg.append(&mut batch1, 3).unwrap();
+            let mut batch2 = make_batch(0, 2000, 2000, 2);
+            seg.append(&mut batch2, 2).unwrap();
+            seg.flush().unwrap();
         }
 
-        let all = mgr.read_all().unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].message_id, ids[0]);
-        assert_eq!(all[1].message_id, ids[1]);
-        assert_eq!(all[2].message_id, ids[2]);
+        // Re-open and verify.
+        let mut seg = Segment::open(dir.path(), 0, 4096).unwrap();
+        assert_eq!(seg.base_offset(), 0);
+        assert_eq!(seg.next_offset(), 5);
+        assert_eq!(seg.size(), 122);
+
+        // Verify read still works.
+        let data = seg.read(0, 4096).unwrap();
+        assert!(data.len() > 0);
+    }
+
+    #[test]
+    fn test_open_recovery_continues_append() {
+        let dir = tempdir().unwrap();
+
+        {
+            let mut seg = Segment::new(dir.path(), 0, 4096).unwrap();
+            let mut batch = make_batch(0, 1000, 1000, 3);
+            seg.append(&mut batch, 3).unwrap();
+            seg.flush().unwrap();
+        }
+
+        let mut seg = Segment::open(dir.path(), 0, 4096).unwrap();
+        let mut batch = make_batch(0, 2000, 2000, 2);
+        let (base, next) = seg.append(&mut batch, 2).unwrap();
+        seg.flush().unwrap();
+
+        assert_eq!(base, 3);
+        assert_eq!(next, 5);
+        assert_eq!(seg.size(), 122);
+    }
+
+    #[test]
+    fn test_segment_file_name() {
+        assert_eq!(segment_file_name(0, "log"), "00000000000000000000.log");
+        assert_eq!(
+            segment_file_name(12345, "index"),
+            "00000000000000012345.index"
+        );
+    }
+
+    #[test]
+    fn test_parse_base_offset() {
+        assert_eq!(parse_base_offset("00000000000000000000.log"), Some(0));
+        assert_eq!(parse_base_offset("00000000000000012345.log"), Some(12345));
+        assert_eq!(parse_base_offset("not_a_number.log"), None);
+    }
+
+    #[test]
+    fn test_index_entries_written() {
+        let dir = tempdir().unwrap();
+        // Use index_interval_bytes = 0 so every batch triggers an index entry
+        // (after the first one, since bytes_since_last_index starts at 0).
+        let mut seg = Segment::new(dir.path(), 0, 0).unwrap();
+
+        // First batch: bytes_since_last_index starts at 0 which is >= 0, so index entry.
+        let mut batch1 = make_batch(0, 1000, 1000, 2);
+        seg.append(&mut batch1, 2).unwrap();
+
+        let mut batch2 = make_batch(0, 2000, 2000, 3);
+        seg.append(&mut batch2, 3).unwrap();
+
+        seg.flush().unwrap();
+
+        // Verify we can read using the index (offset 2 should be found via index).
+        let data = seg.read(2, 4096).unwrap();
+        assert_eq!(record_batch::get_batch_base_offset(&data), 2);
     }
 }

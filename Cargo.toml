@@ -4,38 +4,27 @@ members = [
     "crates/quarkmq-protocol",
     "crates/quarkmq-storage",
     "crates/quarkmq-broker",
-    "crates/quarkmq-cluster",
     "crates/quarkmq-server",
-    "crates/quarkmq-client",
     "tests/integration",
 ]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.26"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 toml = "0.8"
 crc32fast = "1"
 bytes = "1"
-chitchat = "0.12"
-metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tempfile = "3"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-futures-util = "0.3"
 dashmap = "6"
 parking_lot = "0.12"
+kafka-protocol = "0.17"
 
 quarkmq-protocol = { path = "crates/quarkmq-protocol" }
 quarkmq-storage = { path = "crates/quarkmq-storage" }
 quarkmq-broker = { path = "crates/quarkmq-broker" }
-quarkmq-cluster = { path = "crates/quarkmq-cluster" }
 quarkmq-server = { path = "crates/quarkmq-server" }
-quarkmq-client = { path = "crates/quarkmq-client" }

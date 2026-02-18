@@ -1,11 +1,13 @@
-[node]
-id = "node-1"
+[broker]
+node_id = 0
 data_dir = "/var/lib/quarkmq/data"
 
 [server]
-ws_bind = "0.0.0.0:9876"
+bind = "0.0.0.0:9092"
 
-[channels.defaults]
-ack_timeout_secs = 30
-max_delivery_attempts = 5
-max_inflight_per_consumer = 100
+[log]
+segment_bytes = 1073741824
+index_interval_bytes = 4096
+
+[defaults]
+num_partitions = 1

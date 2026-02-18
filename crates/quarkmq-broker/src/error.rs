@@ -2,33 +2,18 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BrokerError {
-    #[error("channel not found: {0}")]
-    ChannelNotFound(String),
-
-    #[error("channel already exists: {0}")]
-    ChannelAlreadyExists(String),
-
-    #[error("topic not found: {0}")]
-    TopicNotFound(String),
-
-    #[error("consumer not subscribed")]
-    NotSubscribed,
-
-    #[error("message not found: {0}")]
-    MessageNotFound(uuid::Uuid),
-
-    #[error("message not inflight: {0}")]
-    MessageNotInflight(uuid::Uuid),
-
-    #[error("message dead-lettered: {0}")]
-    MessageDeadLettered(uuid::Uuid),
-
-    #[error("invalid channel config: {0}")]
-    InvalidConfig(String),
-
     #[error("storage error: {0}")]
     Storage(#[from] quarkmq_storage::StorageError),
-
-    #[error("protocol error: {0}")]
-    Protocol(#[from] quarkmq_protocol::ProtocolError),
+    #[error("topic not found: {0}")]
+    TopicNotFound(String),
+    #[error("topic already exists: {0}")]
+    TopicAlreadyExists(String),
+    #[error("partition not found: {topic} partition {partition}")]
+    PartitionNotFound { topic: String, partition: i32 },
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
+
+pub type Result<T> = std::result::Result<T, BrokerError>;

@@ -1,11 +1,12 @@
-pub mod channel;
-pub mod consumer;
-pub mod dispatcher;
 pub mod error;
-pub mod topic;
+pub mod config;
+pub mod partition;
+pub mod topic_manager;
+pub mod metadata;
+pub mod broker;
 
-pub use channel::Channel;
-pub use consumer::Consumer;
-pub use dispatcher::Dispatcher;
-pub use error::BrokerError;
-pub use topic::Topic;
+pub use broker::Broker;
+pub use config::BrokerConfig;
+pub use error::{BrokerError, Result};
+pub use topic_manager::TopicManager;
+pub use metadata::ClusterMetadata;

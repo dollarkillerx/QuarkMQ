@@ -1,4 +1,4 @@
 pub mod config;
-pub mod error;
+pub mod connection;
 pub mod server;
-pub mod session;
+pub mod handlers;

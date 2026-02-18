@@ -4,15 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-quarkmq-protocol = { workspace = true }
 quarkmq-storage = { workspace = true }
+kafka-protocol = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 

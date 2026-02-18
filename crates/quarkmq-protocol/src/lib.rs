@@ -1,7 +1,7 @@
 pub mod error;
-pub mod message;
-pub mod rpc;
+pub mod frame;
+pub mod handler;
 
-pub use error::ProtocolError;
-pub use message::{Message, MessageId};
-pub use rpc::{JsonRpcRequest, JsonRpcResponse};
+pub use error::{ProtocolError, Result};
+pub use frame::{read_request_frame, write_response_frame};
+pub use handler::{encode_response, parse_request, KafkaRequest};

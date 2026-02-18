@@ -1,11 +1,10 @@
 pub mod error;
-pub mod gc;
-pub mod index;
+pub mod offset_index;
+pub mod time_index;
+pub mod record_batch;
 pub mod segment;
-pub mod wal;
+pub mod commit_log;
 
-pub use error::StorageError;
-pub use gc::GarbageCollector;
-pub use index::MessageIndex;
-pub use segment::{Segment, SegmentManager};
-pub use wal::{Wal, WalOperation, WalRecord};
+pub use commit_log::CommitLog;
+pub use segment::Segment;
+pub use error::{StorageError, Result};
