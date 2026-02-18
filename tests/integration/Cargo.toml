@@ -1,0 +1,17 @@
+[package]
+name = "quarkmq-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+quarkmq-protocol = { workspace = true }
+quarkmq-broker = { workspace = true }
+quarkmq-server = { workspace = true }
+quarkmq-client = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }

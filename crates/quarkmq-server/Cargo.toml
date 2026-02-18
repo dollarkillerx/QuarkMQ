@@ -1,0 +1,25 @@
+[package]
+name = "quarkmq-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "quarkmq"
+path = "src/main.rs"
+
+[dependencies]
+quarkmq-protocol = { workspace = true }
+quarkmq-broker = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
