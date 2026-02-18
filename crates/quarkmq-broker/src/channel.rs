@@ -438,8 +438,19 @@ impl Channel {
                 ));
                 seq += 1;
             }
-            // Record DLQ messages
+            // DLQ messages: write Append first (for recovery to rebuild message body),
+            // then DeadLetter to mark them as dead-lettered.
             for msg in &self.dlq {
+                let data = serde_json::to_vec(msg.as_ref()).map_err(|e| {
+                    BrokerError::Storage(quarkmq_storage::StorageError::Serialization(e))
+                })?;
+                records.push(quarkmq_storage::WalRecord::new(
+                    seq,
+                    WalOperation::Append,
+                    msg.id,
+                    data,
+                ));
+                seq += 1;
                 records.push(quarkmq_storage::WalRecord::new(
                     seq,
                     WalOperation::DeadLetter,
@@ -795,6 +806,36 @@ mod tests {
 
         assert_eq!(ch.dlq_count(), 1);
         assert!(ch.get_message(&msg_id).is_none());
+    }
+
+    #[test]
+    fn test_compact_wal_preserves_dlq_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = default_config("compact-dlq-ch");
+        config.max_delivery_attempts = 1;
+
+        let mut ch = Channel::with_storage(config.clone(), tmp.path()).unwrap();
+        let c = make_consumer_id();
+        ch.subscribe("work", c);
+
+        let msg = make_message("compact-dlq-ch");
+        let msg_id = msg.id;
+        ch.publish(msg).unwrap();
+
+        // Dispatch and nack to dead-letter
+        ch.dispatch();
+        ch.nack(c, &msg_id).unwrap();
+        assert_eq!(ch.dlq_count(), 1);
+
+        // Compact WAL
+        ch.compact_wal().unwrap();
+        ch.sync_wal().unwrap();
+
+        // Recover from compacted WAL and verify DLQ message is preserved
+        let channel_dir = tmp.path().join("compact-dlq-ch");
+        let recovered = Channel::recover(config, &channel_dir).unwrap();
+        assert_eq!(recovered.dlq_count(), 1);
+        assert_eq!(recovered.dlq_messages()[0].id, msg_id);
     }
 
     #[test]

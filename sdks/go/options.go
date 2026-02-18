@@ -5,6 +5,9 @@ import "time"
 // StateChangeFunc is called when the client connection state changes.
 type StateChangeFunc func(oldState, newState ConnectionState)
 
+// ResubscribeErrorFunc is called when a subscription replay fails after reconnect.
+type ResubscribeErrorFunc func(channel, topic string, err error)
+
 // Options configures the QuarkMQ client behavior.
 type Options struct {
 	// HandshakeTimeout is the timeout for the WebSocket handshake.
@@ -38,6 +41,9 @@ type Options struct {
 
 	// OnStateChange is called when the connection state changes.
 	OnStateChange StateChangeFunc
+
+	// OnResubscribeError is called when a subscription replay fails after reconnect.
+	OnResubscribeError ResubscribeErrorFunc
 }
 
 // Option is a functional option for configuring the client.
@@ -106,5 +112,12 @@ func WithBackoff(initial, max time.Duration, multiplier, jitter float64) Option 
 func WithOnStateChange(fn StateChangeFunc) Option {
 	return func(o *Options) {
 		o.OnStateChange = fn
+	}
+}
+
+// WithOnResubscribeError sets the callback invoked when subscription replay fails after reconnect.
+func WithOnResubscribeError(fn ResubscribeErrorFunc) Option {
+	return func(o *Options) {
+		o.OnResubscribeError = fn
 	}
 }

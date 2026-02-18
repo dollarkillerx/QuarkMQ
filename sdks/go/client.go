@@ -159,6 +159,7 @@ func (c *Client) Close() error {
 	err := c.conn.Close()
 	c.connMu.Unlock()
 	c.wg.Wait()
+	close(c.Messages)
 	c.setState(Disconnected)
 	return err
 }
@@ -185,6 +186,12 @@ func (c *Client) dial(ctx context.Context) error {
 
 func (c *Client) readLoop() {
 	defer c.wg.Done()
+
+	// Capture conn reference under lock to avoid racing with dial().
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+
 	for {
 		select {
 		case <-c.done:
@@ -192,7 +199,7 @@ func (c *Client) readLoop() {
 		default:
 		}
 
-		_, msg, err := c.conn.ReadMessage()
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			// Check if we're shutting down
 			select {
@@ -274,6 +281,10 @@ func (c *Client) call(ctx context.Context, method string, params interface{}) (*
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
 		c.respPool.Put(ch)
+		// Trigger reconnect on write failure
+		c.failAllPending(fmt.Errorf("write failed: %w", writeErr))
+		c.setState(Disconnected)
+		c.triggerReconnect()
 		return nil, writeErr
 	}
 
@@ -384,6 +395,47 @@ func (c *Client) Nack(ctx context.Context, messageID string) error {
 		"message_id": messageID,
 	}
 	_, err := c.call(ctx, "nack", params)
+	return err
+}
+
+// DlqMessage represents a message in the dead-letter queue.
+type DlqMessage struct {
+	MessageID string          `json:"message_id"`
+	Channel   string          `json:"channel"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// ListDlqResult is returned by ListDlq.
+type ListDlqResult struct {
+	Messages []DlqMessage `json:"messages"`
+}
+
+// ListDlq returns the dead-letter queue messages for a channel.
+func (c *Client) ListDlq(ctx context.Context, channel string) (*ListDlqResult, error) {
+	params := map[string]interface{}{
+		"channel": channel,
+	}
+	resp, err := c.call(ctx, "list_dlq", params)
+	if err != nil {
+		return nil, err
+	}
+
+	var result ListDlqResult
+	if resp.Result != nil {
+		if err := json.Unmarshal(*resp.Result, &result); err != nil {
+			return nil, err
+		}
+	}
+	return &result, nil
+}
+
+// RetryDlq retries a dead-lettered message by moving it back to pending.
+func (c *Client) RetryDlq(ctx context.Context, channel, messageID string) error {
+	params := map[string]interface{}{
+		"channel":    channel,
+		"message_id": messageID,
+	}
+	_, err := c.call(ctx, "retry_dlq", params)
 	return err
 }
 

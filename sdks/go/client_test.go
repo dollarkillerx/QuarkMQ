@@ -231,6 +231,156 @@ func TestMessagePushDelivery(t *testing.T) {
 	}
 }
 
+func TestListDlq(t *testing.T) {
+	ms := newMockServer(t, func(conn *websocket.Conn, msg []byte) {
+		var req JsonRpcRequest
+		if err := json.Unmarshal(msg, &req); err != nil {
+			t.Errorf("unmarshal error: %v", err)
+			return
+		}
+
+		if req.Method == "list_dlq" {
+			respondSuccess(conn, req.ID, map[string]interface{}{
+				"messages": []map[string]interface{}{
+					{
+						"message_id": "dlq-msg-1",
+						"channel":    "test-channel",
+						"payload":    map[string]interface{}{"data": "dead"},
+					},
+				},
+			})
+		}
+	})
+	defer ms.Close()
+
+	ctx := context.Background()
+	client, err := Connect(ctx, ms.URL(), WithAutoReconnect(false))
+	if err != nil {
+		t.Fatalf("connect error: %v", err)
+	}
+	defer client.Close()
+
+	result, err := client.ListDlq(ctx, "test-channel")
+	if err != nil {
+		t.Fatalf("list dlq error: %v", err)
+	}
+	if len(result.Messages) != 1 {
+		t.Fatalf("expected 1 DLQ message, got %d", len(result.Messages))
+	}
+	if result.Messages[0].MessageID != "dlq-msg-1" {
+		t.Errorf("expected message ID 'dlq-msg-1', got '%s'", result.Messages[0].MessageID)
+	}
+}
+
+func TestRetryDlq(t *testing.T) {
+	ms := newMockServer(t, func(conn *websocket.Conn, msg []byte) {
+		var req JsonRpcRequest
+		if err := json.Unmarshal(msg, &req); err != nil {
+			t.Errorf("unmarshal error: %v", err)
+			return
+		}
+
+		if req.Method == "retry_dlq" {
+			respondSuccess(conn, req.ID, map[string]interface{}{
+				"success": true,
+			})
+		}
+	})
+	defer ms.Close()
+
+	ctx := context.Background()
+	client, err := Connect(ctx, ms.URL(), WithAutoReconnect(false))
+	if err != nil {
+		t.Fatalf("connect error: %v", err)
+	}
+	defer client.Close()
+
+	err = client.RetryDlq(ctx, "test-channel", "dlq-msg-1")
+	if err != nil {
+		t.Fatalf("retry dlq error: %v", err)
+	}
+}
+
+func TestCloseClosesMessagesChannel(t *testing.T) {
+	ms := newMockServer(t, func(conn *websocket.Conn, msg []byte) {
+		// No-op handler
+	})
+	defer ms.Close()
+
+	ctx := context.Background()
+	client, err := Connect(ctx, ms.URL(), WithAutoReconnect(false))
+	if err != nil {
+		t.Fatalf("connect error: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		// This should unblock when Messages is closed
+		for range client.Messages {
+		}
+		close(done)
+	}()
+
+	client.Close()
+
+	select {
+	case <-done:
+		// Success: range over Messages exited
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: range over Messages did not exit after Close()")
+	}
+}
+
+func TestWriteErrorTriggersReconnect(t *testing.T) {
+	ms := newMockServer(t, func(conn *websocket.Conn, msg []byte) {
+		var req JsonRpcRequest
+		if err := json.Unmarshal(msg, &req); err != nil {
+			return
+		}
+		respondSuccess(conn, req.ID, map[string]interface{}{"success": true})
+	})
+
+	ctx := context.Background()
+	client, err := Connect(ctx, ms.URL(),
+		WithAutoReconnect(true),
+		WithBackoff(50*time.Millisecond, 200*time.Millisecond, 2.0, 0.0),
+	)
+	if err != nil {
+		t.Fatalf("connect error: %v", err)
+	}
+	defer client.Close()
+
+	// Force close the underlying connection to make writes fail
+	client.connMu.Lock()
+	client.conn.Close()
+	client.connMu.Unlock()
+
+	// Attempt a call — should fail due to write error
+	_, err = client.Publish(ctx, "test-channel", map[string]interface{}{"data": 1})
+	if err == nil {
+		t.Fatal("expected error from write on closed connection")
+	}
+
+	// Wait for reconnect to kick in
+	time.Sleep(500 * time.Millisecond)
+
+	// Client should have attempted to reconnect (state should be Connected or Connecting)
+	state := client.State()
+	if state == Disconnected {
+		// It may still be reconnecting depending on timing, but it should not stay disconnected
+		// if auto-reconnect is enabled. Give more time.
+		time.Sleep(500 * time.Millisecond)
+		state = client.State()
+	}
+	// With auto-reconnect enabled and the mock server still running,
+	// the client should eventually reconnect
+	if state != Connected && state != Connecting {
+		t.Errorf("expected Connected or Connecting state after write error reconnect, got %s", state)
+	}
+
+	ms.Close()
+}
+
 func TestSerializationRoundtrip(t *testing.T) {
 	ms := newMockServer(t, func(conn *websocket.Conn, msg []byte) {
 		var req JsonRpcRequest

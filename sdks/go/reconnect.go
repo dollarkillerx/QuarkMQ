@@ -123,8 +123,9 @@ func (c *Client) resubscribe() {
 		_, err := c.call(ctx, "subscribe", params)
 		cancel()
 		if err != nil {
-			// Log but continue — channels may not exist yet after server restart
-			_ = err
+			if c.opts.OnResubscribeError != nil {
+				c.opts.OnResubscribeError(sub.channel, sub.topic, err)
+			}
 		}
 	}
 }

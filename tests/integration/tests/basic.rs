@@ -40,6 +40,30 @@ async fn start_test_server() -> (u16, tokio::sync::broadcast::Sender<()>, tempfi
     (port, shutdown_tx, tmp_dir)
 }
 
+/// Start a server on the given port using an existing data dir (for recovery tests).
+/// Returns the shutdown sender and the join handle.
+async fn start_server_with_config(
+    port: u16,
+    data_dir: &str,
+) -> tokio::sync::broadcast::Sender<()> {
+    let mut config = Config::default();
+    config.server.ws_bind = format!("127.0.0.1:{}", port);
+    config.channels.ack_timeout_secs = 30;
+    config.node.data_dir = data_dir.to_string();
+
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+    let shutdown = shutdown_tx.clone();
+
+    let server = Server::new(config);
+    tokio::spawn(async move {
+        server.run(shutdown).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    shutdown_tx
+}
+
 /// Connect a new QuarkMQClient to the test server.
 async fn connect_client(port: u16) -> QuarkMQClient {
     let url = format!("ws://127.0.0.1:{}", port);
@@ -378,4 +402,209 @@ async fn test_nack_redelivery() {
     consumer.ack(push2.message_id).await.unwrap();
 
     let _ = shutdown_tx.send(());
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: DLQ flow end-to-end
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_dlq_flow_end_to_end() {
+    let (port, shutdown_tx, _tmp_dir) = start_test_server().await;
+
+    let admin = connect_client(port).await;
+    // Create channel with max_delivery_attempts=2
+    admin
+        .create_channel("dlq-test", None, Some(2))
+        .await
+        .expect("create_channel should succeed");
+
+    let mut consumer = connect_client(port).await;
+    consumer.subscribe("dlq-test", "work").await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Publish a message
+    let publisher = connect_client(port).await;
+    let payload = serde_json::json!({"task": "fail_me"});
+    let msg_id = publisher
+        .publish("dlq-test", payload.clone())
+        .await
+        .expect("publish should succeed");
+
+    // Dispatch attempt 1 → nack
+    let push1 = timeout(Duration::from_secs(5), consumer.recv_message())
+        .await
+        .expect("should receive message")
+        .expect("should get push");
+    assert_eq!(push1.message_id, msg_id);
+    assert_eq!(push1.attempt, 1);
+    consumer.nack(push1.message_id).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Dispatch attempt 2 → nack (should dead-letter)
+    let push2 = timeout(Duration::from_secs(5), consumer.recv_message())
+        .await
+        .expect("should receive redelivered message")
+        .expect("should get push");
+    assert_eq!(push2.message_id, msg_id);
+    assert_eq!(push2.attempt, 2);
+    consumer.nack(push2.message_id).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify message is in DLQ
+    let dlq_result = admin.list_dlq("dlq-test").await.expect("list_dlq should succeed");
+    assert_eq!(
+        dlq_result.messages.len(),
+        1,
+        "DLQ should contain 1 message, got {}",
+        dlq_result.messages.len()
+    );
+    assert_eq!(dlq_result.messages[0].message_id, msg_id);
+
+    // Retry the DLQ message
+    admin
+        .retry_dlq("dlq-test", msg_id)
+        .await
+        .expect("retry_dlq should succeed");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Message should be redelivered
+    let push3 = timeout(Duration::from_secs(5), consumer.recv_message())
+        .await
+        .expect("should receive retried message")
+        .expect("should get push");
+    assert_eq!(push3.message_id, msg_id);
+
+    // ACK to complete
+    consumer.ack(push3.message_id).await.unwrap();
+
+    // DLQ should be empty now
+    let dlq_result = admin.list_dlq("dlq-test").await.expect("list_dlq should succeed");
+    assert_eq!(
+        dlq_result.messages.len(),
+        0,
+        "DLQ should be empty after retry+ack"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: Delete channel
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_delete_channel() {
+    let (port, shutdown_tx, _tmp_dir) = start_test_server().await;
+    let client = connect_client(port).await;
+
+    // Create a channel
+    client
+        .create_channel("to-delete", None, None)
+        .await
+        .expect("create_channel should succeed");
+
+    // Publish a message to it
+    client
+        .publish("to-delete", serde_json::json!({"data": 1}))
+        .await
+        .expect("publish should succeed");
+
+    // Delete the channel
+    client
+        .delete_channel("to-delete")
+        .await
+        .expect("delete_channel should succeed");
+
+    // Verify it's gone from list_channels
+    let result = client.list_channels().await.expect("list_channels should succeed");
+    let names: Vec<&str> = result.channels.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        !names.contains(&"to-delete"),
+        "channel list should not contain 'to-delete' after deletion, got: {:?}",
+        names
+    );
+
+    // Publishing to deleted channel should fail
+    let err = client
+        .publish("to-delete", serde_json::json!({"data": 2}))
+        .await;
+    assert!(err.is_err(), "publish to deleted channel should fail");
+
+    let _ = shutdown_tx.send(());
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: WAL recovery after restart
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_wal_recovery_after_restart() {
+    let port = free_port();
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let data_dir = tmp_dir.path().to_string_lossy().to_string();
+
+    // Phase 1: Start server, create channel, publish 3 messages, then shutdown
+    let shutdown_tx = start_server_with_config(port, &data_dir).await;
+
+    let admin = connect_client(port).await;
+    admin
+        .create_channel("recovery-ch", None, None)
+        .await
+        .expect("create_channel should succeed");
+
+    let publisher = connect_client(port).await;
+    let mut published_ids = Vec::new();
+    for i in 0..3 {
+        let id = publisher
+            .publish("recovery-ch", serde_json::json!({"msg": i}))
+            .await
+            .expect("publish should succeed");
+        published_ids.push(id);
+    }
+
+    // Give the sync loop time to flush WAL
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Shutdown the server
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Phase 2: Restart with same data_dir, new port (old one might not be released yet)
+    let port2 = free_port();
+    let shutdown_tx2 = start_server_with_config(port2, &data_dir).await;
+
+    // Subscribe and verify we can receive the 3 recovered messages
+    let mut consumer = connect_client(port2).await;
+    consumer
+        .subscribe("recovery-ch", "work")
+        .await
+        .expect("subscribe should succeed");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let received = recv_messages(&mut consumer, 3).await;
+    assert_eq!(
+        received.len(),
+        3,
+        "should recover all 3 messages, got {}",
+        received.len()
+    );
+
+    let received_ids: Vec<_> = received.iter().map(|m| m.message_id).collect();
+    for id in &published_ids {
+        assert!(
+            received_ids.contains(id),
+            "recovered messages should contain published ID {}",
+            id
+        );
+    }
+
+    // ACK all
+    for msg in &received {
+        consumer.ack(msg.message_id).await.unwrap();
+    }
+
+    let _ = shutdown_tx2.send(());
 }

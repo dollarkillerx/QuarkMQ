@@ -1,6 +1,7 @@
 use quarkmq_protocol::rpc::{
-    AckParams, CreateChannelParams, ListChannelsResult, MessagePush, NackParams,
-    PublishParams, PublishResult, SubscribeParams,
+    AckParams, CreateChannelParams, DeleteChannelParams, ListChannelsResult, ListDlqParams,
+    ListDlqResult, MessagePush, NackParams, PublishParams, PublishResult, RetryDlqParams,
+    SubscribeParams,
 };
 use quarkmq_protocol::MessageId;
 
@@ -79,6 +80,44 @@ impl QuarkMQClient {
         let params = NackParams { message_id };
         self.connection
             .call("nack", serde_json::to_value(params).unwrap())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_channel(&self, name: &str) -> Result<(), ClientError> {
+        let params = DeleteChannelParams {
+            name: name.to_string(),
+        };
+        self.connection
+            .call("delete_channel", serde_json::to_value(params).unwrap())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_dlq(&self, channel: &str) -> Result<ListDlqResult, ClientError> {
+        let params = ListDlqParams {
+            channel: channel.to_string(),
+        };
+        let resp = self
+            .connection
+            .call("list_dlq", serde_json::to_value(params).unwrap())
+            .await?;
+        let result: ListDlqResult =
+            serde_json::from_value(resp.result.unwrap_or_default())?;
+        Ok(result)
+    }
+
+    pub async fn retry_dlq(
+        &self,
+        channel: &str,
+        message_id: MessageId,
+    ) -> Result<(), ClientError> {
+        let params = RetryDlqParams {
+            channel: channel.to_string(),
+            message_id,
+        };
+        self.connection
+            .call("retry_dlq", serde_json::to_value(params).unwrap())
             .await?;
         Ok(())
     }

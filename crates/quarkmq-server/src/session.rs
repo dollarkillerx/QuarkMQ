@@ -16,6 +16,17 @@ use quarkmq_protocol::rpc::{
 
 use crate::config::Config;
 
+/// Build a success response, falling back to an internal error if serialization fails.
+fn success_or_internal_error(
+    id: Option<serde_json::Value>,
+    result: impl serde::Serialize,
+) -> JsonRpcResponse {
+    match serde_json::to_value(result) {
+        Ok(v) => JsonRpcResponse::success(id, v),
+        Err(e) => JsonRpcResponse::error(id, rpc::INTERNAL_ERROR, e.to_string()),
+    }
+}
+
 pub struct Session {
     consumer_id: ConsumerId,
     dispatcher: Arc<Dispatcher>,
@@ -76,7 +87,7 @@ impl Session {
         match self.dispatcher.publish(&params.channel, message) {
             Ok(msg_id) => {
                 let result = rpc::PublishResult { message_id: msg_id };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
@@ -96,7 +107,7 @@ impl Session {
         {
             Ok(()) => {
                 let result = rpc::SubscribeResult { success: true };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
@@ -113,7 +124,7 @@ impl Session {
         match self.dispatcher.ack(self.consumer_id, &params.message_id) {
             Ok(()) => {
                 let result = rpc::AckResult { success: true };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
@@ -130,7 +141,7 @@ impl Session {
         match self.dispatcher.nack(self.consumer_id, &params.message_id) {
             Ok(()) => {
                 let result = rpc::NackResult { success: true };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
@@ -156,7 +167,7 @@ impl Session {
                 let result = rpc::CreateChannelResult {
                     name: params.name,
                 };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
@@ -173,7 +184,7 @@ impl Session {
         match self.dispatcher.delete_channel(&params.name) {
             Ok(()) => {
                 let result = rpc::DeleteChannelResult { success: true };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
@@ -182,7 +193,7 @@ impl Session {
     fn handle_list_channels(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         let channels = self.dispatcher.list_channels();
         let result = rpc::ListChannelsResult { channels };
-        JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+        success_or_internal_error(id, result)
     }
 
     fn handle_list_dlq(&self, id: Option<serde_json::Value>, params: serde_json::Value) -> JsonRpcResponse {
@@ -196,7 +207,7 @@ impl Session {
         match self.dispatcher.list_dlq(&params.channel) {
             Ok(messages) => {
                 let result = rpc::ListDlqResult { messages };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
@@ -213,7 +224,7 @@ impl Session {
         match self.dispatcher.retry_dlq(&params.channel, &params.message_id) {
             Ok(()) => {
                 let result = rpc::RetryDlqResult { success: true };
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
+                success_or_internal_error(id, result)
             }
             Err(e) => self.broker_error_to_rpc(id, e),
         }
