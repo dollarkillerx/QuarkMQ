@@ -18,8 +18,8 @@ pub async fn handle_metadata(
 
     let broker_meta = MetadataResponseBroker::default()
         .with_node_id(node_id)
-        .with_host(StrBytes::from_static_str("localhost"))
-        .with_port(9092);
+        .with_host(StrBytes::from_string(broker.config.advertised_host.clone()))
+        .with_port(broker.config.advertised_port);
 
     let requested_topics: Vec<String> = match &req.topics {
         Some(topics) => topics

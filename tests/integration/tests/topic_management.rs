@@ -16,6 +16,7 @@ fn make_test_broker() -> Arc<Broker> {
         segment_bytes: 1024 * 1024,
         index_interval_bytes: 256,
         default_num_partitions: 1,
+        ..Default::default()
     };
     let broker = Broker::new(config);
     broker.start().unwrap();
@@ -196,4 +197,95 @@ async fn test_metadata_all_topics() {
         .collect();
     topic_names.sort();
     assert_eq!(topic_names, vec!["topic-a", "topic-b"]);
+}
+
+#[tokio::test]
+async fn test_create_topic_invalid_name() {
+    let broker = make_test_broker();
+
+    let server = quarkmq_server::server::Server::bind("127.0.0.1:0", broker.clone())
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.split();
+
+    // Try to create topics with invalid names
+    let create_req = CreateTopicsRequest::default()
+        .with_timeout_ms(5000)
+        .with_topics(vec![
+            // Empty name
+            CreatableTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("")))
+                .with_num_partitions(1)
+                .with_replication_factor(1),
+            // Invalid characters
+            CreatableTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("bad/topic")))
+                .with_num_partitions(1)
+                .with_replication_factor(1),
+            // Valid name for comparison
+            CreatableTopic::default()
+                .with_name(TopicName(StrBytes::from_static_str("good-topic")))
+                .with_num_partitions(1)
+                .with_replication_factor(1),
+        ]);
+
+    send_request(&mut writer, ApiKey::CreateTopics, 2, 1, &create_req).await;
+
+    let mut resp_buf = read_response(&mut reader).await;
+    let resp_header_ver = ApiKey::CreateTopics.response_header_version(2);
+    let _resp_header = ResponseHeader::decode(&mut resp_buf, resp_header_ver).unwrap();
+    let create_resp = CreateTopicsResponse::decode(&mut resp_buf, 2).unwrap();
+
+    assert_eq!(create_resp.topics.len(), 3);
+    // Empty name → INVALID_TOPIC_EXCEPTION (17)
+    assert_eq!(create_resp.topics[0].error_code, 17);
+    // Invalid chars → INVALID_TOPIC_EXCEPTION (17)
+    assert_eq!(create_resp.topics[1].error_code, 17);
+    // Valid name → success (0)
+    assert_eq!(create_resp.topics[2].error_code, 0);
+}
+
+#[tokio::test]
+async fn test_metadata_returns_correct_broker_address() {
+    let broker = make_test_broker();
+    broker.topic_manager.create_topic("addr-test", 1).unwrap();
+
+    let server = quarkmq_server::server::Server::bind("127.0.0.1:0", broker.clone())
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.split();
+
+    let metadata_req = MetadataRequest::default().with_topics(None);
+    send_request(&mut writer, ApiKey::Metadata, 1, 1, &metadata_req).await;
+
+    let mut resp_buf = read_response(&mut reader).await;
+    let resp_header_ver = ApiKey::Metadata.response_header_version(1);
+    let _resp_header = ResponseHeader::decode(&mut resp_buf, resp_header_ver).unwrap();
+    let metadata_resp = MetadataResponse::decode(&mut resp_buf, 1).unwrap();
+
+    // The broker address should be "localhost" (since we bind to 127.0.0.1 which
+    // is not a wildcard, but BrokerConfig defaults advertised_host to "localhost")
+    assert_eq!(metadata_resp.brokers.len(), 1);
+    assert_eq!(metadata_resp.brokers[0].host.to_string(), "localhost");
+    // Port defaults to 9092 from BrokerConfig::default() since integration tests
+    // construct BrokerConfig with ..Default::default()
+    assert_eq!(metadata_resp.brokers[0].port, 9092);
 }

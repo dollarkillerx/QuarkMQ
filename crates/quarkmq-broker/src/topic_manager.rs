@@ -173,6 +173,7 @@ mod tests {
             segment_bytes: 1024 * 1024,
             index_interval_bytes: 4096,
             default_num_partitions: 1,
+            ..Default::default()
         }
     }
 

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::*;
+use kafka_protocol::messages::api_versions_request::ApiVersionsRequest;
+use kafka_protocol::messages::api_versions_response::ApiVersionsResponse;
 use kafka_protocol::messages::produce_request::*;
 use kafka_protocol::messages::fetch_request::*;
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
@@ -91,6 +93,7 @@ fn make_test_broker() -> Arc<Broker> {
         segment_bytes: 1024 * 1024,
         index_interval_bytes: 256,
         default_num_partitions: 1,
+        ..Default::default()
     };
     let broker = Broker::new(config);
     broker.start().unwrap();
@@ -394,4 +397,147 @@ async fn test_produce_fetch_via_tcp() {
     assert_eq!(partition_data.high_watermark, 1);
     assert!(partition_data.records.is_some());
     assert!(!partition_data.records.as_ref().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_unsupported_api_keeps_connection_alive() {
+    let broker = make_test_broker();
+
+    let server = quarkmq_server::server::Server::bind("127.0.0.1:0", broker.clone())
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.split();
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Send a FindCoordinator request (api_key=10), which is known but not implemented.
+    // The server should return an error response but keep the connection alive.
+    let mut req_buf = BytesMut::new();
+    let mut header = RequestHeader::default();
+    header.request_api_key = 10; // FindCoordinator
+    header.request_api_version = 0;
+    header.correlation_id = 100;
+    // FindCoordinator uses header version based on api version
+    let header_ver = ApiKey::FindCoordinator.request_header_version(0);
+    header.encode(&mut req_buf, header_ver).unwrap();
+    // Minimal body: coordinator_key as empty string (2 bytes length + 0 bytes)
+    req_buf.extend_from_slice(&0i16.to_be_bytes());
+
+    let len = req_buf.len() as u32;
+    writer.write_all(&len.to_be_bytes()).await.unwrap();
+    writer.write_all(&req_buf).await.unwrap();
+    writer.flush().await.unwrap();
+
+    // Read the error response
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await.unwrap();
+    let resp_len = u32::from_be_bytes(len_buf);
+    let mut resp_body = vec![0u8; resp_len as usize];
+    reader.read_exact(&mut resp_body).await.unwrap();
+
+    // Verify correlation_id is preserved
+    let mut resp_buf = BytesMut::from(&resp_body[..]);
+    let resp_header = ResponseHeader::decode(&mut resp_buf, 0).unwrap();
+    assert_eq!(resp_header.correlation_id, 100);
+
+    // Now send a valid ApiVersions request to prove the connection is still alive
+    let mut req_buf2 = BytesMut::new();
+    let mut header2 = RequestHeader::default();
+    header2.request_api_key = ApiKey::ApiVersions as i16;
+    header2.request_api_version = 0;
+    header2.correlation_id = 101;
+    let header_ver2 = ApiKey::ApiVersions.request_header_version(0);
+    header2.encode(&mut req_buf2, header_ver2).unwrap();
+    ApiVersionsRequest::default().encode(&mut req_buf2, 0).unwrap();
+
+    let len2 = req_buf2.len() as u32;
+    writer.write_all(&len2.to_be_bytes()).await.unwrap();
+    writer.write_all(&req_buf2).await.unwrap();
+    writer.flush().await.unwrap();
+
+    // Read the ApiVersions response
+    reader.read_exact(&mut len_buf).await.unwrap();
+    let resp_len2 = u32::from_be_bytes(len_buf);
+    let mut resp_body2 = vec![0u8; resp_len2 as usize];
+    reader.read_exact(&mut resp_body2).await.unwrap();
+
+    let mut resp_buf2 = BytesMut::from(&resp_body2[..]);
+    let resp_header_ver = ApiKey::ApiVersions.response_header_version(0);
+    let resp_header2 = ResponseHeader::decode(&mut resp_buf2, resp_header_ver).unwrap();
+    assert_eq!(resp_header2.correlation_id, 101);
+
+    let resp2 = ApiVersionsResponse::decode(&mut resp_buf2, 0).unwrap();
+    assert_eq!(resp2.error_code, 0);
+    assert!(!resp2.api_keys.is_empty());
+}
+
+#[tokio::test]
+async fn test_api_versions_v3() {
+    let broker = make_test_broker();
+
+    let server = quarkmq_server::server::Server::bind("127.0.0.1:0", broker.clone())
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        server.run().await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.split();
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Send ApiVersions v3 request (what modern Kafka clients send first)
+    let mut req_buf = BytesMut::new();
+    let mut header = RequestHeader::default();
+    header.request_api_key = ApiKey::ApiVersions as i16;
+    header.request_api_version = 3;
+    header.correlation_id = 1;
+    let header_ver = ApiKey::ApiVersions.request_header_version(3);
+    header.encode(&mut req_buf, header_ver).unwrap();
+    ApiVersionsRequest::default().encode(&mut req_buf, 3).unwrap();
+
+    let len = req_buf.len() as u32;
+    writer.write_all(&len.to_be_bytes()).await.unwrap();
+    writer.write_all(&req_buf).await.unwrap();
+    writer.flush().await.unwrap();
+
+    // Read response
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await.unwrap();
+    let resp_len = u32::from_be_bytes(len_buf);
+    let mut resp_body = vec![0u8; resp_len as usize];
+    reader.read_exact(&mut resp_body).await.unwrap();
+
+    // Decode v3 response
+    let mut resp_buf = BytesMut::from(&resp_body[..]);
+    let resp_header_ver = ApiKey::ApiVersions.response_header_version(3);
+    let resp_header = ResponseHeader::decode(&mut resp_buf, resp_header_ver).unwrap();
+    assert_eq!(resp_header.correlation_id, 1);
+
+    let resp = ApiVersionsResponse::decode(&mut resp_buf, 3).unwrap();
+    assert_eq!(resp.error_code, 0);
+    assert!(!resp.api_keys.is_empty());
+
+    // Verify ApiVersions reports v0-v3 support
+    let api_ver_entry = resp
+        .api_keys
+        .iter()
+        .find(|k| k.api_key == ApiKey::ApiVersions as i16)
+        .expect("ApiVersions entry should exist");
+    assert_eq!(api_ver_entry.min_version, 0);
+    assert_eq!(api_ver_entry.max_version, 3);
 }

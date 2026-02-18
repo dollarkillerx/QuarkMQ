@@ -112,6 +112,22 @@ fn default_num_partitions() -> i32 {
     1
 }
 
+/// Parse a bind address string (e.g. "0.0.0.0:9092") into (host, port).
+/// If the host is "0.0.0.0" or "::", use "localhost" as the advertised host
+/// since clients can't connect to a wildcard address.
+fn parse_bind_address(bind: &str) -> (String, i32) {
+    if let Some((host, port_str)) = bind.rsplit_once(':') {
+        let port = port_str.parse::<i32>().unwrap_or(9092);
+        let host = match host {
+            "0.0.0.0" | "::" | "" => "localhost".to_string(),
+            h => h.to_string(),
+        };
+        (host, port)
+    } else {
+        ("localhost".to_string(), 9092)
+    }
+}
+
 pub struct ServerConfig {
     pub bind: String,
     pub broker_config: BrokerConfig,
@@ -148,12 +164,17 @@ impl ServerConfig {
             })
             .unwrap_or(file_config.broker.node_id);
 
+        // Parse advertised address from bind address as defaults.
+        let (advertised_host, advertised_port) = parse_bind_address(&bind);
+
         let broker_config = BrokerConfig {
             node_id,
             data_dir,
             segment_bytes: file_config.log.segment_bytes,
             index_interval_bytes: file_config.log.index_interval_bytes,
             default_num_partitions: file_config.defaults.num_partitions,
+            advertised_host,
+            advertised_port,
         };
 
         Ok(Self {

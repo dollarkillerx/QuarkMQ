@@ -29,8 +29,8 @@ impl ClusterMetadata {
         // Add broker info (single node).
         let mut broker = MetadataResponseBroker::default();
         broker.node_id = BrokerId(self.config.node_id);
-        broker.host = StrBytes::from_static_str("localhost");
-        broker.port = 9092;
+        broker.host = StrBytes::from_string(self.config.advertised_host.clone());
+        broker.port = self.config.advertised_port;
         response.brokers = vec![broker];
 
         // Controller id.
